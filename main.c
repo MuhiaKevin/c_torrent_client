@@ -9,6 +9,7 @@
 #include <stdbool.h>
 #include "arena.h"
 #include <ctype.h>
+#include <ctype.h>
 
 
 typedef uint8_t  u8;
@@ -29,6 +30,7 @@ typedef ssize_t  isize;
 #define BUFFER_SIZE 500
 
 typedef struct {
+	const char *file_name;
 	u8 *data;
 	size_t len;
 } Buffer;
@@ -60,12 +62,23 @@ Buffer read_entire_file(const char *path, Arena *arena ) {
 	}
 
 
+	// set the length of the buffer equal to the size of the file 
 	buf.len = (size_t)st.st_size;
+	buf.file_name = path;
+
+	// allocate buffer for the text
 	buf.data = arena_alloc(arena, buf.len);
 
 
 	ssize_t  total = 0;
+
 	while(total < (ssize_t)buf.len) {
+		// Read up to the remaining free space in the buffer, and append the data after what I’ve already read.
+		
+		// read from file descriptor(fd) to buffer whose buffer starts at buffer.data + total number of bytes read and read the next buffer.len - total
+		
+		// Adding total moves the pointer forward, so the new data is written after the existing data instead of overwriting it.
+		
 		ssize_t n = read(fd, buf.data + total, buf.len - total);
 
 		if(n <= 0) {
@@ -74,6 +87,7 @@ Buffer read_entire_file(const char *path, Arena *arena ) {
 			return (Buffer){0};
 
 		}
+		// set the number of bytes already read
 		total += n;
 	}
 
@@ -87,6 +101,31 @@ void print_ascii(const u8 *data, size_t len) {
     }
     putchar('\n');
 }
+
+
+void hexdump_ascii(const u8 *data, size_t len) {
+    for (size_t i = 0; i < len; i += 16) {
+        printf("%08zx  ", i);
+
+        for (size_t j = 0; j < 16; j++) {
+            if (i + j < len)
+                printf("%02x ", data[i + j]);
+            else
+                printf("   ");
+        }
+
+        printf(" |");
+
+        for (size_t j = 0; j < 16; j++) {
+            if (i + j < len) {
+                u8 c = data[i + j];
+                putchar(isprint(c) ? c : '.');
+            }
+        }
+        printf("|\n");
+    }
+}
+
 
 
 int main(int argc, char **argv) {
@@ -109,7 +148,9 @@ int main(int argc, char **argv) {
 	}
 
 
-	print_ascii(torrent.data, torrent.len);
+	 print_ascii(torrent.data, torrent.len);
+	//hexdump_ascii(torrent.data, torrent.len);
+
 
 	arena_destroy(&arena);
 }
