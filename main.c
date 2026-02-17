@@ -28,10 +28,6 @@ typedef ssize_t  isize;
 #define PORT 8080
 #define BUFFER_SIZE 500
 
-
-
-
-
 typedef struct {
 	const char *file_name;
 	u8 *data;
@@ -299,7 +295,6 @@ void print_bcode(BcodeNode *node, int indent) {
 
 Buffer read_entire_file(const char *path, Arena *arena ) {
 	Buffer buf = {0};
-
 
 	int fd = open(path, O_RDONLY);
 	if(fd < 0) {
