@@ -15,8 +15,6 @@ Arena  arena_create(size_t capacity){
 	return arena;
 }
 
-
-
 void *arena_alloc(Arena *arena, size_t size) {
 	assert(arena->offset + size <= arena->capacity &&  "Arena out of memory");
 
@@ -31,16 +29,12 @@ void  arena_reset(Arena *arena) {
 	arena->offset = 0;
 }
 
-
-
 void  arena_destroy(Arena *arena) {
 	free(arena->buffer);
 	arena->buffer = NULL;
 	arena->capacity = 0;
 	arena->offset = 0;
 }
-
-
 
 static size_t align_forward(size_t ptr, size_t align) {
 	size_t mod = ptr & (align - 1);
@@ -51,9 +45,6 @@ static size_t align_forward(size_t ptr, size_t align) {
 	return ptr;
 }
 
-
-
-
 void  *arena_alloc_aligned(Arena *arena, size_t size, size_t align) {
 	size_t current = (size_t)(arena->buffer + arena->offset);
 	size_t aligned = align_forward(current, align);
@@ -62,5 +53,4 @@ void  *arena_alloc_aligned(Arena *arena, size_t size, size_t align) {
 	assert(new_offset <= arena->capacity);
 	arena->offset = new_offset;
 	return (void *)aligned;
-
 }
