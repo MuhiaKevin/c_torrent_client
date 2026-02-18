@@ -1,3 +1,10 @@
+#ifdef _WIN32
+    #define WIN32_LEAN_AND_MEAN
+    #include <windows.h>
+    #include <stdio.h>
+    #include <stdint.h>
+#include "arena.h"
+#else
 #include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -9,7 +16,7 @@
 #include <stdbool.h>
 #include "arena.h"
 #include <ctype.h>
-
+#endif
 
 typedef uint8_t  u8;
 typedef uint16_t u16;
@@ -20,7 +27,11 @@ typedef int8_t   i8;
 typedef int16_t  i16;
 typedef int32_t  i32;
 typedef int64_t  i64;
-typedef ssize_t  isize;
+#ifdef _WIN32
+    typedef long long isize;
+#else
+    typedef ssize_t isize;
+#endif
 
 #define TRUE  1
 #define FALSE 0
@@ -183,15 +194,25 @@ BcodeNode* parse_list(Parser *p) {
 BcodeNode* parse_dict(Parser *p) {
     p->pos++; // skip 'd'
     
+    // Allocate a dictionary node
     BcodeNode *node = arena_alloc(p->arena, sizeof(BcodeNode));
     node->type = BCODE_DICT;
     node->dict_val.count = 0;
+    
+    // Allocate initial storage 
+    // This creates two arrays
+    // keys[4]
+    // values[4]
     
     size_t capacity = 4;
     node->dict_val.keys = arena_alloc(p->arena, capacity * sizeof(BcodeNode*));
     node->dict_val.values = arena_alloc(p->arena, capacity * sizeof(BcodeNode*));
     
+    // Main Loop — Parse Until 'e' 
+    // As long as we haven’t reached the terminating e, we keep parsing key-value pairs. 
     while (p->pos < p->len && p->data[p->pos] != 'e') {
+
+        // If dictionary has more than 4 entries:
         if (node->dict_val.count >= capacity) {
             capacity *= 2;
             BcodeNode **new_keys = arena_alloc(p->arena, capacity * sizeof(BcodeNode*));
@@ -293,61 +314,112 @@ void print_bcode(BcodeNode *node, int indent) {
 }
 
 
-Buffer read_entire_file(const char *path, Arena *arena ) {
-	Buffer buf = {0};
+#ifdef _WIN32
+// Windows version using Win32 API
+Buffer read_entire_file(const char *path, Arena *arena) {
+    Buffer buf = {0};
 
-	int fd = open(path, O_RDONLY);
-	if(fd < 0) {
-		perror("open");
-		return buf;
-	}
+    HANDLE hFile = CreateFileA(
+        path,
+        GENERIC_READ,
+        FILE_SHARE_READ,
+        NULL,
+        OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL,
+        NULL
+    );
 
-	struct stat st;
-	if(fstat(fd, &st) < 0) {
-		perror("fstat");
-		close(fd);
-		return buf;
-	}
+    if (hFile == INVALID_HANDLE_VALUE) {
+        fprintf(stderr, "Failed to open file: %s (Error: %lu)\n", path, GetLastError());
+        return buf;
+    }
 
+    LARGE_INTEGER fileSize;
+    if (!GetFileSizeEx(hFile, &fileSize)) {
+        fprintf(stderr, "Failed to get file size (Error: %lu)\n", GetLastError());
+        CloseHandle(hFile);
+        return buf;
+    }
 
-	if (!S_ISREG(st.st_mode)) {
-		fprintf(stderr, "Not a regular file\n");
-		close(fd);
-		return buf;
-	}
+    if (fileSize.QuadPart > SIZE_MAX) {
+        fprintf(stderr, "File too large\n");
+        CloseHandle(hFile);
+        return buf;
+    }
 
+    buf.len = (size_t)fileSize.QuadPart;
+    buf.file_name = path;
+    buf.data = arena_alloc(arena, buf.len);
 
-	// set the length of the buffer equal to the size of the file 
-	buf.len = (size_t)st.st_size;
-	buf.file_name = path;
+    DWORD totalRead = 0;
+    while (totalRead < buf.len) {
+        DWORD toRead = (DWORD)(buf.len - totalRead);
+        DWORD bytesRead;
 
-	// allocate buffer for the text
-	buf.data = arena_alloc(arena, buf.len);
+        if (!ReadFile(hFile, buf.data + totalRead, toRead, &bytesRead, NULL)) {
+            fprintf(stderr, "Read failed (Error: %lu)\n", GetLastError());
+            CloseHandle(hFile);
+            return (Buffer){0};
+        }
 
+        if (bytesRead == 0) {
+            fprintf(stderr, "Unexpected end of file\n");
+            CloseHandle(hFile);
+            return (Buffer){0};
+        }
 
-	ssize_t  total = 0;
+        totalRead += bytesRead;
+    }
 
-	while(total < (ssize_t)buf.len) {
-		// Read up to the remaining free space in the buffer, and append the data after what I’ve already read.
-		
-		// read from file descriptor(fd) to buffer whose buffer starts at buffer.data + total number of bytes read and read the next buffer.len - total
-		
-		// Adding total moves the pointer forward, so the new data is written after the existing data instead of overwriting it.
-		
-		ssize_t n = read(fd, buf.data + total, buf.len - total);
-
-		if(n <= 0) {
-			perror("read");
-			close(fd);
-			return (Buffer){0};
-
-		}
-		// set the number of bytes already read
-		total += n;
-	}
-
-	return buf;
+    CloseHandle(hFile);
+    return buf;
 }
+
+#else
+// Linux version (your original code)
+Buffer read_entire_file(const char *path, Arena *arena) {
+    Buffer buf = {0};
+
+    int fd = open(path, O_RDONLY);
+    if(fd < 0) {
+        perror("open");
+        return buf;
+    }
+
+    struct stat st;
+    if(fstat(fd, &st) < 0) {
+        perror("fstat");
+        close(fd);
+        return buf;
+    }
+
+    if (!S_ISREG(st.st_mode)) {
+        fprintf(stderr, "Not a regular file\n");
+        close(fd);
+        return buf;
+    }
+
+    buf.len = (size_t)st.st_size;
+    buf.file_name = path;
+    buf.data = arena_alloc(arena, buf.len);
+
+    ssize_t total = 0;
+    while(total < (ssize_t)buf.len) {
+        ssize_t n = read(fd, buf.data + total, buf.len - total);
+
+        if(n <= 0) {
+            perror("read");
+            close(fd);
+            return (Buffer){0};
+        }
+        total += n;
+    }
+
+    close(fd);
+    return buf;
+}
+#endif
+
 
 void print_ascii(const u8 *data, size_t len) {
     for (size_t i = 0; i < len; i++) {
