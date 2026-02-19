@@ -28,10 +28,15 @@ typedef SOCKET socket_t;
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <netdb.h>
+#include <ctype.h>
+#include <sys/select.h>
+#include <sys/time.h>
+#include <sys/types.h>
+
 
 typedef int socket_t;
 #define INVALID_SOCKET_VALUE -1
-#define close_socket closeinclude <ctype.h>
+#define close_socket close
 
 #endif
 
@@ -55,6 +60,75 @@ typedef int64_t  i64;
 
 #define PORT 8080
 #define BUFFER_SIZE 500
+
+#ifdef _WIN32
+    #include <winsock2.h>
+    #include <ws2tcpip.h>
+    #pragma comment(lib, "ws2_32.lib")
+    
+    typedef SOCKET socket_t;
+    #define INVALID_SOCKET_VALUE INVALID_SOCKET
+    #define close_socket closesocket
+#else
+    #include <sys/socket.h>
+    #include <netinet/in.h>
+    #include <arpa/inet.h>
+    #include <netdb.h>
+    
+    typedef int socket_t;
+    #define INVALID_SOCKET_VALUE -1
+    #define close_socket close
+#endif
+
+// Protocol constants
+#define PROTOCOL_ID 0x41727101980LL  // Magic constant for UDP trackers
+#define ACTION_CONNECT  0
+#define ACTION_ANNOUNCE 1
+#define ACTION_SCRAPE   2
+#define ACTION_ERROR    3
+
+// Connect request/response
+typedef struct {
+    u64 protocol_id;  // 0x41727101980
+    u32 action;       // 0 for connect
+    u32 transaction_id;
+} __attribute__((packed)) ConnectRequest;
+
+typedef struct {
+    u32 action;       // 0 for connect
+    u32 transaction_id;
+    u64 connection_id;
+} __attribute__((packed)) ConnectResponse;
+
+// Announce request/response
+typedef struct {
+    u64 connection_id;
+    u32 action;       // 1 for announce
+    u32 transaction_id;
+    u8  info_hash[20];
+    u8  peer_id[20];
+    u64 downloaded;
+    u64 left;
+    u64 uploaded;
+    u32 event;        // 0: none, 1: completed, 2: started, 3: stopped
+    u32 ip_address;   // 0 for default
+    u32 key;          // random
+    i32 num_want;     // -1 for default
+    u16 port;         // your listening port
+} __attribute__((packed)) AnnounceRequest;
+
+typedef struct {
+    u32 action;       // 1 for announce
+    u32 transaction_id;
+    u32 interval;     // seconds to wait before re-announcing
+    u32 leechers;
+    u32 seeders;
+} __attribute__((packed)) AnnounceResponse;
+
+typedef struct {
+    u32 ip;
+    u16 port;
+} __attribute__((packed)) Peer;
 
 
 typedef struct {
@@ -667,15 +741,15 @@ TorrentFile  buildTorrentFile(BcodeNode *root, Arena *arena) {
     // Extract announce-list (list of tracker tiers)
     BcodeNode *announce_list = dict_get(root, "announce-list");
     if (announce_list && announce_list->type == BCODE_LIST) {
-        printf("\nTracker tiers:\n");
+        /*printf("\nTracker tiers:\n");*/
         for (size_t i = 0; i < announce_list->list_val.count; i++) {
             BcodeNode *tier = announce_list->list_val.items[i];
             if (tier->type == BCODE_LIST) {
-                printf("  Tier %zu:\n", i + 1);
+                /*printf("  Tier %zu:\n", i + 1);*/
                 for (size_t j = 0; j < tier->list_val.count; j++) {
                     BcodeNode *tracker = tier->list_val.items[j];
                     if (tracker->type == BCODE_STRING) {
-                        printf("    - %s\n", tracker->string_val.data);
+                        /*printf("    - %s\n", tracker->string_val.data);*/
                     }
                 }
             }
@@ -688,6 +762,322 @@ TorrentFile  buildTorrentFile(BcodeNode *root, Arena *arena) {
     torrentFile.announce_list = announce_list;
 
     return torrentFile ;
+}
+
+
+// Helper: Convert big-endian to host byte order for 64-bit
+u64 be64toh_custom(u64 val) {
+#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+    return ((val & 0xFF00000000000000ULL) >> 56) |
+    ((val & 0x00FF000000000000ULL) >> 40) |
+    ((val & 0x0000FF0000000000ULL) >> 24) |
+    ((val & 0x000000FF00000000ULL) >> 8)  |
+    ((val & 0x00000000FF000000ULL) << 8)  |
+    ((val & 0x0000000000FF0000ULL) << 24) |
+    ((val & 0x000000000000FF00ULL) << 40) |
+    ((val & 0x00000000000000FFULL) << 56);
+#else
+    return val;
+#endif
+}
+
+u64 htobe64_custom(u64 val) {
+    return be64toh_custom(val);
+}
+
+// Initialize networking (Windows needs this)
+int init_networking(void) {
+#ifdef _WIN32
+    WSADATA wsa;
+    if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) {
+        fprintf(stderr, "WSAStartup failed\n");
+        return -1;
+    }
+#endif
+    return 0;
+}
+
+void cleanup_networking(void) {
+#ifdef _WIN32
+    WSACleanup();
+#endif
+}
+
+// Parse tracker URL
+typedef struct {
+    char host[256];
+    int port;
+} TrackerURL;
+
+int parse_tracker_url(const char *url, TrackerURL *out) {
+    // Expected format: udp://hostname:port/announce
+    if (strncmp(url, "udp://", 6) != 0) {
+        fprintf(stderr, "Not a UDP tracker URL\n");
+        return -1;
+    }
+
+    const char *start = url + 6;
+    const char *colon = strchr(start, ':');
+    if (!colon) {
+        fprintf(stderr, "Invalid tracker URL format\n");
+        return -1;
+    }
+
+    size_t host_len = colon - start;
+    if (host_len >= sizeof(out->host)) {
+        fprintf(stderr, "Hostname too long\n");
+        return -1;
+    }
+
+    memcpy(out->host, start, host_len);
+    out->host[host_len] = '\0';
+
+    out->port = atoi(colon + 1);
+    if (out->port <= 0 || out->port > 65535) {
+        fprintf(stderr, "Invalid port\n");
+        return -1;
+    }
+
+    return 0;
+}
+
+
+// Generate random transaction ID
+u32 random_transaction_id(void) {
+    return (u32)time(NULL) ^ (u32)getpid();
+}
+
+// Generate random peer ID
+void generate_peer_id(u8 peer_id[20]) {
+    memcpy(peer_id, "-UT2026-", 8);  // Client ID: uTorrent 2026
+    for (int i = 8; i < 20; i++) {
+        peer_id[i] = '0' + (rand() % 10);
+    }
+}
+
+// Step 1: Connect to tracker
+int tracker_connect(socket_t sock, struct sockaddr_in *tracker_addr, u64 *connection_id) {
+    ConnectRequest req = {0};
+    req.protocol_id = htobe64_custom(PROTOCOL_ID);
+    req.action = htonl(ACTION_CONNECT);
+    req.transaction_id = htonl(random_transaction_id());
+
+    printf("Sending connect request...\n");
+    if (sendto(sock, (char*)&req, sizeof(req), 0, 
+               (struct sockaddr*)tracker_addr, sizeof(*tracker_addr)) < 0) {
+        perror("sendto failed");
+        return -1;
+    }
+
+    // Wait for response (with timeout)
+    fd_set readfds;
+    struct timeval tv;
+    tv.tv_sec = 15;
+    tv.tv_usec = 0;
+
+    FD_ZERO(&readfds);
+    FD_SET(sock, &readfds);
+
+    int ret = select(sock + 1, &readfds, NULL, NULL, &tv);
+    if (ret <= 0) {
+        fprintf(stderr, "Connect timeout or error\n");
+        return -1;
+    }
+
+    ConnectResponse resp = {0};
+    socklen_t addr_len = sizeof(*tracker_addr);
+    ssize_t n = recvfrom(sock, (char*)&resp, sizeof(resp), 0, 
+                         (struct sockaddr*)tracker_addr, &addr_len);
+
+    if (n < (ssize_t)sizeof(resp)) {
+        fprintf(stderr, "Invalid connect response size\n");
+        return -1;
+    }
+
+    resp.action = ntohl(resp.action);
+    resp.transaction_id = ntohl(resp.transaction_id);
+    resp.connection_id = be64toh_custom(resp.connection_id);
+
+    if (resp.action != ACTION_CONNECT) {
+        fprintf(stderr, "Invalid action in response\n");
+        return -1;
+    }
+
+    if (resp.transaction_id != ntohl(req.transaction_id)) {
+        fprintf(stderr, "Transaction ID mismatch\n");
+        return -1;
+    }
+
+    *connection_id = resp.connection_id;
+    printf("Connected! Connection ID: %llx\n", (unsigned long long)*connection_id);
+    return 0;
+}
+
+// Step 2: Announce to tracker
+int tracker_announce(socket_t sock, struct sockaddr_in *tracker_addr, 
+                     u64 connection_id, const u8 info_hash[20], 
+                     Peer **peers_out, size_t *peer_count_out, Arena *arena) {
+    AnnounceRequest req = {0};
+    req.connection_id = htobe64_custom(connection_id);
+    req.action = htonl(ACTION_ANNOUNCE);
+    req.transaction_id = htonl(random_transaction_id());
+    memcpy(req.info_hash, info_hash, 20);
+
+    generate_peer_id(req.peer_id);
+
+    req.downloaded = 0;
+    req.left = htobe64_custom(0);  // Pretend we have everything for now
+    req.uploaded = 0;
+    req.event = htonl(2);  // 2 = started
+    req.ip_address = 0;
+    req.key = htonl(rand());
+    req.num_want = htonl(50);  // Request 50 peers
+    req.port = htons(6881);    // Standard BitTorrent port
+
+    printf("Sending announce request...\n");
+    if (sendto(sock, (char*)&req, sizeof(req), 0,
+               (struct sockaddr*)tracker_addr, sizeof(*tracker_addr)) < 0) {
+        perror("sendto failed");
+        return -1;
+    }
+
+    // Wait for response
+    fd_set readfds;
+    struct timeval tv;
+    tv.tv_sec = 15;
+    tv.tv_usec = 0;
+
+    FD_ZERO(&readfds);
+    FD_SET(sock, &readfds);
+
+    int ret = select(sock + 1, &readfds, NULL, NULL, &tv);
+    if (ret <= 0) {
+        fprintf(stderr, "Announce timeout or error\n");
+        return -1;
+    }
+
+    // Receive response (header + peers)
+    u8 buffer[2048];
+    socklen_t addr_len = sizeof(*tracker_addr);
+    ssize_t n = recvfrom(sock, (char*)buffer, sizeof(buffer), 0,
+                         (struct sockaddr*)tracker_addr, &addr_len);
+
+    if (n < (ssize_t)sizeof(AnnounceResponse)) {
+        fprintf(stderr, "Invalid announce response size\n");
+        return -1;
+    }
+
+    AnnounceResponse *resp = (AnnounceResponse*)buffer;
+    resp->action = ntohl(resp->action);
+    resp->transaction_id = ntohl(resp->transaction_id);
+    resp->interval = ntohl(resp->interval);
+    resp->leechers = ntohl(resp->leechers);
+    resp->seeders = ntohl(resp->seeders);
+
+    if (resp->action == ACTION_ERROR) {
+        fprintf(stderr, "Tracker error: %.*s\n", (int)(n - 8), buffer + 8);
+        return -1;
+    }
+
+    if (resp->action != ACTION_ANNOUNCE) {
+        fprintf(stderr, "Invalid action in announce response\n");
+        return -1;
+    }
+
+    printf("\nTracker Stats:\n");
+    printf("  Seeders: %u\n", resp->seeders);
+    printf("  Leechers: %u\n", resp->leechers);
+    printf("  Interval: %u seconds\n", resp->interval);
+
+    // Parse peer list
+    size_t peer_data_size = n - sizeof(AnnounceResponse);
+    size_t num_peers = peer_data_size / sizeof(Peer);
+
+    if (num_peers > 0) {
+        Peer *peer_list = (Peer*)(buffer + sizeof(AnnounceResponse));
+        Peer *peers = arena_alloc(arena, num_peers * sizeof(Peer));
+        memcpy(peers, peer_list, num_peers * sizeof(Peer));
+
+        *peers_out = peers;
+        *peer_count_out = num_peers;
+    } else {
+        *peers_out = NULL;
+        *peer_count_out = 0;
+    }
+
+    return 0;
+}
+
+// Main tracker communication function
+int communicate_with_tracker(const char *tracker_url, const u8 info_hash[20], Arena *arena) {
+    if (init_networking() < 0) {
+        return -1;
+    }
+
+    TrackerURL url;
+    if (parse_tracker_url(tracker_url, &url) < 0) {
+        cleanup_networking();
+        return -1;
+    }
+
+    printf("Connecting to tracker: %s:%d\n", url.host, url.port);
+
+    // Resolve hostname
+    struct hostent *he = gethostbyname(url.host);
+    if (!he) {
+        fprintf(stderr, "Failed to resolve hostname\n");
+        cleanup_networking();
+        return -1;
+    }
+
+    // Create UDP socket
+    socket_t sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (sock == INVALID_SOCKET_VALUE) {
+        perror("socket failed");
+        cleanup_networking();
+        return -1;
+    }
+
+    // Set up tracker address
+    struct sockaddr_in tracker_addr = {0};
+    tracker_addr.sin_family = AF_INET;
+    tracker_addr.sin_port = htons(url.port);
+    memcpy(&tracker_addr.sin_addr, he->h_addr_list[0], he->h_length);
+
+    // Step 1: Connect
+    u64 connection_id;
+    if (tracker_connect(sock, &tracker_addr, &connection_id) < 0) {
+        close_socket(sock);
+        cleanup_networking();
+        return -1;
+    }
+
+    // Step 2: Announce
+    Peer *peers = NULL;
+    size_t peer_count = 0;
+    if (tracker_announce(sock, &tracker_addr, connection_id, info_hash, 
+                         &peers, &peer_count, arena) < 0) {
+        close_socket(sock);
+        cleanup_networking();
+        return -1;
+    }
+
+    // Print peer list
+    printf("\nReceived %zu peers:\n", peer_count);
+    for (size_t i = 0; i < peer_count; i++) {  // Print first 10
+        u32 ip = ntohl(peers[i].ip);
+        u16 port = ntohs(peers[i].port);
+        printf("  %u.%u.%u.%u:%u\n",
+               (ip >> 24) & 0xFF,
+               (ip >> 16) & 0xFF,
+               (ip >> 8) & 0xFF,
+               ip & 0xFF,
+               port);
+    }
+
+    close_socket(sock);
+    cleanup_networking();
+    return 0;
 }
 
 
@@ -733,6 +1123,17 @@ int main(int argc, char **argv) {
     // Uncomment to see full structure
     // print_bcode(root, 0);
     /*split_pieces(root, &arena);*/
+
+
+    // Get tracker URL
+    BcodeNode *announce = dict_get(root, "announce");
+    if (announce && announce->type == BCODE_STRING) {
+        printf("Tracker: %s\n\n", announce->string_val.data);
+
+        // Communicate with tracker
+        communicate_with_tracker((char*)announce->string_val.data, torrentFile.info_hash, &arena);
+    }
+
 
     arena_destroy(&arena);
     return 0;
