@@ -36,7 +36,7 @@ DEBUG_FLAGS = -DDEBUG -O0 -g -fsanitize=address
 LDLIBS  = -lssl -lcrypto 
 TARGET  = /tmp/torrent_client
 SRC     = main.c arena.c
-RELEASE_FLAGS = -DNDEBUG
+RELEASE_FLAGS = -DNDEBUG -O2
 
 
 config ?= debug
