@@ -30,13 +30,14 @@
 # CC      = gcc
 CC      = clang
 CFLAGS  = -g -O0 -Wall -Wextra -Wpedantic
+LDLIBS  = -lssl -lcrypto 
 TARGET  = /tmp/torrent_client
 SRC     = main.c arena.c
 
 all: $(TARGET)
 
 $(TARGET): $(SRC)
-	$(CC) $(CFLAGS) $(SRC) -o $(TARGET)
+	$(CC) $(LDLIBS) $(CFLAGS)  $(SRC) -o $(TARGET)
 
 clean:
 	rm -f $(TARGET)

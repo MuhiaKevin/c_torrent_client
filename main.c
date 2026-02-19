@@ -1,3 +1,5 @@
+#include <openssl/sha.h>
+
 #ifdef _WIN32
     #define WIN32_LEAN_AND_MEAN
     #include <windows.h>
@@ -39,11 +41,21 @@ typedef int64_t  i64;
 #define PORT 8080
 #define BUFFER_SIZE 500
 
+
 typedef struct {
 	const char *file_name;
 	u8 *data;
 	size_t len;
 } Buffer;
+
+
+
+typedef struct {
+    u8 *buffer;
+    size_t capacity;
+    size_t pos;
+    Arena *arena;
+} Encoder;
 
 
 // Add these to your main file after the existing typedefs
@@ -87,6 +99,9 @@ typedef struct {
 
 // Forward declaration
 BcodeNode* parse_value(Parser *p);
+
+// Forward declaration
+void encode_node(Encoder *enc, BcodeNode *node);
 
 // Parse integer: i<number>e
 BcodeNode* parse_int(Parser *p) {
@@ -296,8 +311,6 @@ void split_pieces(BcodeNode *root, Arena *arena) {
             size_t hash_len = 20;
             size_t num_hashes = pieces->string_val.len / hash_len;
 
-
-
             // create a array of piecces hash with each array item being 20 bytes
             u8 *hashes = arena_alloc(arena, (sizeof(u8) * 20) * num_hashes);
 
@@ -307,9 +320,11 @@ void split_pieces(BcodeNode *root, Arena *arena) {
             }
             pieces_buffer->data = hashes;
 
-            for (size_t i = 0; i < num_hashes; i++) {
-                print_single_hash(&hashes[i]);
-            }
+            printf("pieces length %zu\n", pieces_buffer->len);
+
+            /*for (size_t i = 0; i < num_hashes; i++) {*/
+            /*    print_single_hash(&pieces_buffer->data[i]);*/
+            /*}*/
 
         }
     }
@@ -317,9 +332,6 @@ void split_pieces(BcodeNode *root, Arena *arena) {
 
 
 // Usage: print_single_hash((uint8_t*)res.hashes[5]);  // 6th hash
-
-
-
 
 // Pretty print for debugging
 void print_bcode(BcodeNode *node, int indent) {
@@ -501,6 +513,92 @@ void hexdump_ascii(const u8 *data, size_t len) {
 
 
 
+void encode_ensure(Encoder *enc, size_t needed) {
+    if (enc->pos + needed > enc->capacity) {
+        size_t new_cap = enc->capacity * 2;
+        while (new_cap < enc->pos + needed) {
+            new_cap *= 2;
+        }
+        u8 *new_buf = arena_alloc(enc->arena, new_cap);
+        memcpy(new_buf, enc->buffer, enc->pos);
+        enc->buffer = new_buf;
+        enc->capacity = new_cap;
+    }
+} 
+
+void encode_bytes(Encoder *enc, const u8 *data, size_t len) {
+    encode_ensure(enc, len);
+    memcpy(enc->buffer + enc->pos, data, len);
+    enc->pos += len;
+}
+
+void encode_str(Encoder *enc, const char *str) {
+    encode_bytes(enc, (const u8*)str, strlen(str));
+}
+
+void encode_list(Encoder *enc, BcodeNode *node) {
+    encode_str(enc, "l");
+    for (size_t i = 0; i < node->list_val.count; i++) {
+        encode_node(enc, node->list_val.items[i]);
+    }
+    encode_str(enc, "e");
+} 
+void encode_string(Encoder *enc, u8 *data, size_t len) {
+    char buf[32];
+    int prefix_len = snprintf(buf, sizeof(buf), "%zu:", len);
+    encode_bytes(enc, (u8*)buf, prefix_len);
+    encode_bytes(enc, data, len);
+}
+
+void encode_dict(Encoder *enc, BcodeNode *node) {
+    encode_str(enc, "d");
+    for (size_t i = 0; i < node->dict_val.count; i++) {
+        encode_node(enc, node->dict_val.keys[i]);
+        encode_node(enc, node->dict_val.values[i]);
+    }
+    encode_str(enc, "e");
+}
+
+void encode_int(Encoder *enc, i64 val) {
+    char buf[32];
+    int len = snprintf(buf, sizeof(buf), "i%llde", (long long)val);
+    encode_bytes(enc, (u8*)buf, len);
+} 
+
+
+void encode_node(Encoder *enc, BcodeNode *node) {
+    switch (node->type) {
+        case BCODE_INT:
+            encode_int(enc, node->int_val);
+            break;
+        case BCODE_STRING:
+            encode_string(enc, node->string_val.data, node->string_val.len);
+            break;
+        case BCODE_LIST:
+            encode_list(enc, node);
+            break;
+        case BCODE_DICT:
+            encode_dict(enc, node);
+            break;
+    }
+
+}
+
+// Calculate SHA-1 hash of the info dictionary
+void calculate_info_hash(BcodeNode *info, u8 hash[20], Arena *arena) {
+    Encoder enc;
+
+    enc.capacity = 4096;
+    enc.buffer = arena_alloc(arena, enc.capacity);
+    enc.pos = 0;
+    enc.arena = arena;
+
+    encode_node(&enc, info);
+    
+    SHA1(enc.buffer, enc.pos, hash);
+}
+
+
 int main(int argc, char **argv) {
     if(argc < 2) {
         fprintf(stderr, "Usage: %s <filename>\n", argv[0]);
@@ -543,6 +641,14 @@ int main(int argc, char **argv) {
 
     BcodeNode *info = dict_get(root, "info");
     if (info && info->type == BCODE_DICT) {
+
+        u8 info_hash[20];
+        calculate_info_hash(info, info_hash, &arena);
+
+
+        printf("info_hash: ");
+        print_single_hash((u8 *)&info_hash);
+
         BcodeNode *name = dict_get(info, "name");
         if (name && name->type == BCODE_STRING) {
             printf("Name: %s\n", name->string_val.data);
