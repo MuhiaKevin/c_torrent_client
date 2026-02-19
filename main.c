@@ -97,6 +97,17 @@ typedef struct {
     Arena *arena;
 } Parser;
 
+
+// Torrent struct
+typedef struct {
+    u8 *announce;
+    u8 info_hash[20];
+    u8 *name;
+    Buffer *pieceHashes;
+    i64  piece_length ;
+    i64 length;
+}  TorrentFile;
+
 // Forward declaration
 BcodeNode* parse_value(Parser *p);
 
@@ -298,14 +309,17 @@ void print_single_hash(u8 *hash_ptr) {  // hash_ptr points to start of one 20-by
 }
 
 
-void split_pieces(BcodeNode *root, Arena *arena) {
+Buffer *split_pieces(BcodeNode *root, Arena *arena) {
+    // create a buffer for the pieces
+    Buffer *pieces_buffer = {0};
+
     BcodeNode *info = dict_get(root, "info");
     if (info && info->type == BCODE_DICT) {
 
         BcodeNode *pieces = dict_get(info, "pieces");
         if (pieces && pieces->type == BCODE_STRING) {
-            // create a buffer for the pieces
-            Buffer *pieces_buffer = arena_alloc(arena, sizeof(Buffer));
+
+            pieces_buffer = arena_alloc(arena, sizeof(Buffer));
             pieces_buffer ->len = pieces->string_val.len;
 
             size_t hash_len = 20;
@@ -328,6 +342,8 @@ void split_pieces(BcodeNode *root, Arena *arena) {
 
         }
     }
+
+    return  pieces_buffer;
 }
 
 
@@ -599,6 +615,61 @@ void calculate_info_hash(BcodeNode *info, u8 hash[20], Arena *arena) {
 }
 
 
+TorrentFile  buildTorrentFile(BcodeNode *root, Arena *arena) {
+    TorrentFile torrentFile = {0};
+
+    // Extract some info
+    BcodeNode *announce = dict_get(root, "announce");
+    if (announce && announce->type == BCODE_STRING) {
+        /*printf("Tracker: %s\n", announce->string_val.data);*/
+        torrentFile.announce = announce->string_val.data;
+    }
+
+    BcodeNode *info = dict_get(root, "info");
+    if (info && info->type == BCODE_DICT) {
+
+        u8 info_hash[20];
+        calculate_info_hash(info, info_hash, arena);
+        memcpy(torrentFile.info_hash, info_hash, 20);
+
+        /*printf("info_hash: ");*/
+        /*print_single_hash((u8 *)&info_hash);*/
+
+        BcodeNode *name = dict_get(info, "name");
+        if (name && name->type == BCODE_STRING) {
+            /*printf("Name: %s\n", name->string_val.data);*/
+            torrentFile.name = name->string_val.data;
+        }
+
+        BcodeNode *piece_length = dict_get(info, "piece length");
+        if (piece_length && piece_length->type == BCODE_INT) {
+            /*printf("Piece length: %lld\n", (long long)piece_length->int_val);*/
+            torrentFile.piece_length = piece_length->int_val;
+        }
+    }
+
+    // Extract announce-list (list of tracker tiers)
+    BcodeNode *announce_list = dict_get(root, "announce-list");
+    if (announce_list && announce_list->type == BCODE_LIST) {
+        /*printf("\nTracker tiers:\n");*/
+        for (size_t i = 0; i < announce_list->list_val.count; i++) {
+            BcodeNode *tier = announce_list->list_val.items[i];
+            if (tier->type == BCODE_LIST) {
+                /*printf("  Tier %zu:\n", i + 1);*/
+                for (size_t j = 0; j < tier->list_val.count; j++) {
+                    BcodeNode *tracker = tier->list_val.items[j];
+                    if (tracker->type == BCODE_STRING) {
+                        /*printf("    - %s\n", tracker->string_val.data);*/
+                    }
+                }
+            }
+        }
+    }
+
+    return torrentFile ;
+}
+
+
 int main(int argc, char **argv) {
     if(argc < 2) {
         fprintf(stderr, "Usage: %s <filename>\n", argv[0]);
@@ -633,56 +704,14 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    // Extract some info
-    BcodeNode *announce = dict_get(root, "announce");
-    if (announce && announce->type == BCODE_STRING) {
-        printf("Tracker: %s\n", announce->string_val.data);
-    }
 
-    BcodeNode *info = dict_get(root, "info");
-    if (info && info->type == BCODE_DICT) {
-
-        u8 info_hash[20];
-        calculate_info_hash(info, info_hash, &arena);
-
-
-        printf("info_hash: ");
-        print_single_hash((u8 *)&info_hash);
-
-        BcodeNode *name = dict_get(info, "name");
-        if (name && name->type == BCODE_STRING) {
-            printf("Name: %s\n", name->string_val.data);
-        }
-        
-        BcodeNode *piece_length = dict_get(info, "piece length");
-        if (piece_length && piece_length->type == BCODE_INT) {
-            printf("Piece length: %lld\n", (long long)piece_length->int_val);
-        }
-    }
-
-
-
-      // Extract announce-list (list of tracker tiers)
-    BcodeNode *announce_list = dict_get(root, "announce-list");
-    if (announce_list && announce_list->type == BCODE_LIST) {
-        printf("\nTracker tiers:\n");
-        for (size_t i = 0; i < announce_list->list_val.count; i++) {
-            BcodeNode *tier = announce_list->list_val.items[i];
-            if (tier->type == BCODE_LIST) {
-                printf("  Tier %zu:\n", i + 1);
-                for (size_t j = 0; j < tier->list_val.count; j++) {
-                    BcodeNode *tracker = tier->list_val.items[j];
-                    if (tracker->type == BCODE_STRING) {
-                        printf("    - %s\n", tracker->string_val.data);
-                    }
-                }
-            }
-        }
-    }
+    TorrentFile torrentFile = buildTorrentFile(root, &arena);
+    printf("%s\n", torrentFile.name);
+    print_single_hash(torrentFile.info_hash);
 
     // Uncomment to see full structure
     // print_bcode(root, 0);
-    split_pieces(root, &arena);
+    /*split_pieces(root, &arena);*/
 
     arena_destroy(&arena);
     return 0;
