@@ -106,6 +106,7 @@ typedef struct {
     Buffer *pieceHashes;
     i64  piece_length ;
     i64 length;
+    BcodeNode  *announce_list;
 }  TorrentFile;
 
 // Forward declaration
@@ -651,20 +652,25 @@ TorrentFile  buildTorrentFile(BcodeNode *root, Arena *arena) {
     // Extract announce-list (list of tracker tiers)
     BcodeNode *announce_list = dict_get(root, "announce-list");
     if (announce_list && announce_list->type == BCODE_LIST) {
-        /*printf("\nTracker tiers:\n");*/
+        printf("\nTracker tiers:\n");
         for (size_t i = 0; i < announce_list->list_val.count; i++) {
             BcodeNode *tier = announce_list->list_val.items[i];
             if (tier->type == BCODE_LIST) {
-                /*printf("  Tier %zu:\n", i + 1);*/
+                printf("  Tier %zu:\n", i + 1);
                 for (size_t j = 0; j < tier->list_val.count; j++) {
                     BcodeNode *tracker = tier->list_val.items[j];
                     if (tracker->type == BCODE_STRING) {
-                        /*printf("    - %s\n", tracker->string_val.data);*/
+                        printf("    - %s\n", tracker->string_val.data);
                     }
                 }
             }
         }
     }
+
+
+    Buffer *pieceHashes = split_pieces(root, arena);
+    torrentFile.pieceHashes = pieceHashes;
+    torrentFile.announce_list = announce_list;
 
     return torrentFile ;
 }
