@@ -29,10 +29,23 @@
 
 # CC      = gcc
 CC      = clang
-CFLAGS  = -g -O0 -Wall -Wextra -Wpedantic
+CFLAGS  = -m64 -std=c99 -Wall -Wextra -Wpedantic
+
+# If building debug:
+DEBUG_FLAGS = -DDEBUG -O0 -g -fsanitize=address 
 LDLIBS  = -lssl -lcrypto 
 TARGET  = /tmp/torrent_client
 SRC     = main.c arena.c
+RELEASE_FLAGS = -DNDEBUG
+
+
+config ?= debug
+
+ifeq ($(config), debug)
+	CFLAGS += $(DEBUG_FLAGS)
+else
+	CFLAGS += $(RELEASE_FLAGS)
+endif
 
 all: $(TARGET)
 
