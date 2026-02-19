@@ -1,10 +1,17 @@
 #include <openssl/sha.h>
 
 #ifdef _WIN32
-    #define WIN32_LEAN_AND_MEAN
-    #include <windows.h>
-    #include <stdio.h>
-    #include <stdint.h>
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#include <stdio.h>
+#include <stdint.h>
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#pragma comment(lib, "ws2_32.lib")
+
+typedef SOCKET socket_t;
+#define INVALID_SOCKET_VALUE INVALID_SOCKET
+#define close_socket closesocket
 #include "arena.h"
 #else
 #include <fcntl.h>
@@ -17,7 +24,15 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include "arena.h"
-#include <ctype.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <netdb.h>
+
+typedef int socket_t;
+#define INVALID_SOCKET_VALUE -1
+#define close_socket closeinclude <ctype.h>
+
 #endif
 
 typedef uint8_t  u8;
