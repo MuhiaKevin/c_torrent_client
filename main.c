@@ -275,6 +275,52 @@ BcodeNode* dict_get(BcodeNode *dict, const char *key) {
     return NULL;
 }
 
+void print_single_hash(u8 *hash_ptr) {  // hash_ptr points to start of one 20-byte hash
+    for (int j = 0; j < 20; j++) {
+        printf("%02x", hash_ptr[j]);
+    }
+    printf("\n");
+}
+
+
+void split_pieces(BcodeNode *root, Arena *arena) {
+    BcodeNode *info = dict_get(root, "info");
+    if (info && info->type == BCODE_DICT) {
+
+        BcodeNode *pieces = dict_get(info, "pieces");
+        if (pieces && pieces->type == BCODE_STRING) {
+            // create a buffer for the pieces
+            Buffer *pieces_buffer = arena_alloc(arena, sizeof(Buffer));
+            pieces_buffer ->len = pieces->string_val.len;
+
+            size_t hash_len = 20;
+            size_t num_hashes = pieces->string_val.len / hash_len;
+
+
+
+            // create a array of piecces hash with each array item being 20 bytes
+            u8 *hashes = arena_alloc(arena, (sizeof(u8) * 20) * num_hashes);
+
+            // copy each 20 byte piece hash to new array
+            for (size_t i = 0; i < num_hashes; i++) {
+                memcpy((hashes + i * hash_len), pieces->string_val.data + i * hash_len, hash_len);
+            }
+            pieces_buffer->data = hashes;
+
+            for (size_t i = 0; i < num_hashes; i++) {
+                print_single_hash(&hashes[i]);
+            }
+
+        }
+    }
+}
+
+
+// Usage: print_single_hash((uint8_t*)res.hashes[5]);  // 6th hash
+
+
+
+
 // Pretty print for debugging
 void print_bcode(BcodeNode *node, int indent) {
     if (!node) return;
@@ -530,6 +576,7 @@ int main(int argc, char **argv) {
 
     // Uncomment to see full structure
     // print_bcode(root, 0);
+    split_pieces(root, &arena);
 
     arena_destroy(&arena);
     return 0;
