@@ -32,6 +32,7 @@ typedef SOCKET socket_t;
 #include <sys/select.h>
 #include <sys/time.h>
 #include <sys/types.h>
+#include <time.h>
 
 
 typedef int socket_t;
