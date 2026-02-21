@@ -81,6 +81,12 @@ typedef int64_t  i64;
     #define close_socket close
 #endif
 
+
+// Macros for defining size
+#define KB(x) ((size_t)(x) * 1024ULL)
+#define MB(x) (KB(x) * 1024ULL)
+#define GB(x) (MB(x) * 1024ULL) 
+
 // Protocol constants
 #define PROTOCOL_ID 0x41727101980LL  // Magic constant for UDP trackers
 #define ACTION_CONNECT  0
@@ -1092,7 +1098,8 @@ int main(int argc, char **argv) {
     // << is the bitwise left shift operator. 
     // it means : 1 × 2^20  = 1 << 20 = 1,048,576 
     // That’s 1 megabyte (1 MB) in bytes. 
-    Arena arena = arena_create(40ULL * 1024 * 1024); 
+    // adding ULL makes it explicitly 64-bit and avoids overflow if you later change it to something 
+    Arena arena = arena_create(MB(40)); 
 
     Buffer torrent = read_entire_file(argv[1], &arena);
     if (!torrent.data) {
