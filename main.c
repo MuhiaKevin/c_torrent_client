@@ -1088,7 +1088,11 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    Arena arena = arena_create(1 << 20);
+
+    // << is the bitwise left shift operator. 
+    // it means : 1 × 2^20  = 1 << 20 = 1,048,576 
+    // That’s 1 megabyte (1 MB) in bytes. 
+    Arena arena = arena_create(40 * (1 << 20));
 
     Buffer torrent = read_entire_file(argv[1], &arena);
     if (!torrent.data) {
