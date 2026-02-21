@@ -37,6 +37,7 @@ LDLIBS  = -lssl -lcrypto
 TARGET  = /tmp/torrent_client
 SRC     = main.c arena.c
 RELEASE_FLAGS = -DNDEBUG -O2
+TORRENT_FILE = ./kingdom.torrent
 
 
 config ?= debug
@@ -56,7 +57,7 @@ clean:
 	rm -f $(TARGET)
 
 valgrind: $(TARGET)
-	valgrind --leak-check=full --track-origins=yes $(TARGET) 8080
+	valgrind --leak-check=full --track-origins=yes $(TARGET) $(TORRENT_FILE )
 
 run:
-	/tmp/torrent_client ./totk.torrent
+	/tmp/torrent_client $(TORRENT_FILE)
