@@ -823,22 +823,37 @@ int parse_tracker_url(const char *url, TrackerURL *out) {
         return -1;
     }
 
+
+    // url is a pointer to start of the string 
+    // add 6 + start of pointer to the string to get text past udp://
     const char *start = url + 6;
+    printf("%p\n", start);
+
+
+    // get pointer address of the location of the colon character in the tracker url 
     const char *colon = strchr(start, ':');
     if (!colon) {
         fprintf(stderr, "Invalid tracker URL format\n");
         return -1;
     }
 
+    // length of the host name i.e strlen("opentor.net") == 11;
     size_t host_len = colon - start;
+    fprintf(stdout, "Lenght of host name %zu \n", host_len);
+
+    // make host_len is not longer than 256
     if (host_len >= sizeof(out->host)) {
         fprintf(stderr, "Hostname too long\n");
         return -1;
     }
 
+    // copy that string to trakcer_url.host
     memcpy(out->host, start, host_len);
+
+    // add null terminator for the string 
     out->host[host_len] = '\0';
 
+    // convert port to interger and set to the struct
     out->port = atoi(colon + 1);
     if (out->port <= 0 || out->port > 65535) {
         fprintf(stderr, "Invalid port\n");
@@ -1029,7 +1044,7 @@ int communicate_with_tracker(const char *tracker_url, const u8 info_hash[20], Ar
 
     printf("Connecting to tracker: %s:%d\n", url.host, url.port);
 
-    // Resolve hostname
+    // Resolve hostname: get the ip address of the host name
     struct hostent *he = gethostbyname(url.host);
     if (!he) {
         fprintf(stderr, "Failed to resolve hostname\n");
