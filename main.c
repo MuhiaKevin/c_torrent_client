@@ -431,7 +431,7 @@ Buffer *split_pieces(BcodeNode *root, Arena *arena) {
             }
             pieces_buffer->data = hashes;
 
-            printf("pieces length %zu\n", pieces_buffer->len);
+            /*printf("pieces length %zu\n", pieces_buffer->len);*/
 
             /*for (size_t i = 0; i < num_hashes; i++) {*/
             /*    print_single_hash(&pieces_buffer->data[i]);*/
@@ -1129,8 +1129,8 @@ int main(int argc, char **argv) {
 
 
     TorrentFile torrentFile = buildTorrentFile(root, &arena);
-    printf("%s\n", torrentFile.name);
-    print_single_hash(torrentFile.info_hash);
+    /*printf("%s\n", torrentFile.name);*/
+    /*print_single_hash(torrentFile.info_hash);*/
 
     // Uncomment to see full structure
     // print_bcode(root, 0);
