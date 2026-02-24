@@ -827,8 +827,6 @@ int parse_tracker_url(const char *url, TrackerURL *out) {
     // url is a pointer to start of the string 
     // add 6 + start of pointer to the string to get text past udp://
     const char *start = url + 6;
-    printf("%p\n", start);
-
 
     // get pointer address of the location of the colon character in the tracker url 
     const char *colon = strchr(start, ':');
@@ -839,7 +837,6 @@ int parse_tracker_url(const char *url, TrackerURL *out) {
 
     // length of the host name i.e strlen("opentor.net") == 11;
     size_t host_len = colon - start;
-    fprintf(stdout, "Lenght of host name %zu \n", host_len);
 
     // make host_len is not longer than 256
     if (host_len >= sizeof(out->host)) {
