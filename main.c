@@ -1041,6 +1041,7 @@ int communicate_with_tracker(const char *tracker_url, const u8 info_hash[20], Ar
 
     printf("Connecting to tracker: %s:%d\n", url.host, url.port);
 
+    // TODO: use getaddrinfo instead of this
     // Resolve hostname: get the ip address of the host name
     struct hostent *he = gethostbyname(url.host);
     if (!he) {
