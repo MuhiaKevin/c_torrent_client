@@ -792,6 +792,14 @@ u64 htobe64_custom(u64 val) {
     return be64toh_custom(val);
 }
 
+static inline u64 swap64(u64 x) {
+#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+    return __builtin_bswap64(x);
+#else
+    return x;
+#endif
+}
+
 // Initialize networking (Windows needs this)
 int init_networking(void) {
 #ifdef _WIN32
@@ -877,7 +885,8 @@ void generate_peer_id(u8 peer_id[20]) {
 // Step 1: Connect to tracker
 int tracker_connect(socket_t sock, struct sockaddr_in *tracker_addr, u64 *connection_id) {
     ConnectRequest req = {0};
-    req.protocol_id = htobe64_custom(PROTOCOL_ID);
+    /*req.protocol_id = htobe64_custom(PROTOCOL_ID);*/
+    req.protocol_id = swap64(PROTOCOL_ID);
     req.action = htonl(ACTION_CONNECT);
     req.transaction_id = htonl(random_transaction_id());
 
@@ -933,11 +942,10 @@ int tracker_connect(socket_t sock, struct sockaddr_in *tracker_addr, u64 *connec
 }
 
 // Step 2: Announce to tracker
-int tracker_announce(socket_t sock, struct sockaddr_in *tracker_addr, 
-                     u64 connection_id, const u8 info_hash[20], 
-                     Peer **peers_out, size_t *peer_count_out, Arena *arena) {
+int tracker_announce(socket_t sock, struct sockaddr_in *tracker_addr, u64 connection_id, const u8 info_hash[20], Peer **peers_out, size_t *peer_count_out, Arena *arena) {
     AnnounceRequest req = {0};
-    req.connection_id = htobe64_custom(connection_id);
+    /*req.connection_id = htobe64_custom(connection_id);*/
+    req.connection_id = swap64(connection_id);
     req.action = htonl(ACTION_ANNOUNCE);
     req.transaction_id = htonl(random_transaction_id());
     memcpy(req.info_hash, info_hash, 20);
@@ -945,7 +953,8 @@ int tracker_announce(socket_t sock, struct sockaddr_in *tracker_addr,
     generate_peer_id(req.peer_id);
 
     req.downloaded = 0;
-    req.left = htobe64_custom(0);  // Pretend we have everything for now
+    /*req.left = htobe64_custom(0);  // Pretend we have everything for now*/
+    req.left = swap64(0);  // Pretend we have everything for now
     req.uploaded = 0;
     req.event = htonl(2);  // 2 = started
     req.ip_address = 0;
@@ -1075,8 +1084,7 @@ int communicate_with_tracker(const char *tracker_url, const u8 info_hash[20], Ar
     // Step 2: Announce
     Peer *peers = NULL;
     size_t peer_count = 0;
-    if (tracker_announce(sock, &tracker_addr, connection_id, info_hash, 
-                         &peers, &peer_count, arena) < 0) {
+    if (tracker_announce(sock, &tracker_addr, connection_id, info_hash, &peers, &peer_count, arena) < 0) {
         close_socket(sock);
         cleanup_networking();
         return -1;
