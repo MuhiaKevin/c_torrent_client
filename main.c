@@ -76,7 +76,6 @@ typedef int64_t  i64;
     #include <arpa/inet.h>
     #include <netdb.h>
     
-    typedef int socket_t;
     #define INVALID_SOCKET_VALUE -1
     #define close_socket close
 #endif
@@ -962,97 +961,102 @@ int tracker_connect(socket_t sock, struct sockaddr_in *tracker_addr, u64 *connec
 
 // Step 2: Announce to tracker
 int tracker_announce(socket_t sock, struct sockaddr_in *tracker_addr, u64 connection_id, const u8 info_hash[20], Peer **peers_out, size_t *peer_count_out, Arena *arena) {
-    AnnounceRequest req = {0};
-    /*req.connection_id = htobe64_custom(connection_id);*/
-    req.connection_id = swap64(connection_id);
-    req.action = htonl(ACTION_ANNOUNCE);
-    req.transaction_id = htonl(random_transaction_id());
-    memcpy(req.info_hash, info_hash, 20);
-
-    generate_peer_id(req.peer_id);
-
-    req.downloaded = 0;
-    /*req.left = htobe64_custom(0);  // Pretend we have everything for now*/
-    req.left = swap64(0);  // Pretend we have everything for now
-    req.uploaded = 0;
-    req.event = htonl(2);  // 2 = started
-    req.ip_address = 0;
-    req.key = htonl(rand());
-    req.num_want = htonl(50);  // Request 50 peers
-    req.port = htons(6881);    // Standard BitTorrent port
-
-    printf("Sending announce request...\n");
-    if (sendto(sock, (char*)&req, sizeof(req), 0,
-               (struct sockaddr*)tracker_addr, sizeof(*tracker_addr)) < 0) {
-        perror("sendto failed");
-        return -1;
-    }
-
-    // Wait for response
-    fd_set readfds;
-    struct timeval tv;
-    tv.tv_sec = 15;
-    tv.tv_usec = 0;
-
-    FD_ZERO(&readfds);
-    FD_SET(sock, &readfds);
-
-    int ret = select(sock + 1, &readfds, NULL, NULL, &tv);
-    if (ret <= 0) {
-        fprintf(stderr, "Announce timeout or error\n");
-        return -1;
-    }
-
-    // Receive response (header + peers)
-    u8 buffer[2048];
+    const int max_retries = 5;
+    int timeout = 5; 
     socklen_t addr_len = sizeof(*tracker_addr);
-    ssize_t n = recvfrom(sock, (char*)buffer, sizeof(buffer), 0,
-                         (struct sockaddr*)tracker_addr, &addr_len);
 
-    if (n < (ssize_t)sizeof(AnnounceResponse)) {
-        fprintf(stderr, "Invalid announce response size\n");
-        return -1;
+    for(int attempt = 0;  attempt < max_retries; attempt++) {
+        AnnounceRequest req = {0};
+        /*req.connection_id = htobe64_custom(connection_id);*/
+        req.connection_id = swap64(connection_id);
+        req.action = htonl(ACTION_ANNOUNCE);
+
+        u32 tx_id = random_transaction_id();
+        req.transaction_id = htonl(tx_id);
+
+
+        memcpy(req.info_hash, info_hash, 20);
+
+        generate_peer_id(req.peer_id);
+
+        req.downloaded = 0;
+        /*req.left = htobe64_custom(0);  // Pretend we have everything for now*/
+        req.left = swap64(0);  // Pretend we have everything for now
+        req.uploaded = 0;
+        req.event = htonl(2);  // 2 = started
+        req.ip_address = 0;
+        req.key = htonl(rand());
+        req.num_want = htonl(50);  // Request 50 peers
+        req.port = htons(6881);    // Standard BitTorrent port
+
+
+        printf("Announce attempt %d (timeout=%d sec)\n", attempt + 1, timeout);
+
+        printf("Sending announce request...\n");
+        if (sendto(sock, (char*)&req, sizeof(req), 0, (struct sockaddr*)tracker_addr, sizeof(*tracker_addr)) < 0) {
+            perror("sendto failed");
+            return -1;
+        }
+
+
+        int wait = wait_for_response(sock, timeout);
+
+        if(wait == 1) { 
+            // Receive response (header + peers)
+            u8 buffer[2048];
+            ssize_t n = recvfrom(sock, (char*)buffer, sizeof(buffer), 0, (struct sockaddr*)tracker_addr, &addr_len);
+
+            if (n >= (ssize_t)sizeof(AnnounceResponse)) {
+                AnnounceResponse resp;
+                memcpy(&resp, buffer, sizeof(resp));
+
+                resp.action = ntohl(resp.action);
+                resp.transaction_id = ntohl(resp.transaction_id);
+                resp.interval = ntohl(resp.interval);
+                resp.leechers = ntohl(resp.leechers);
+                resp.seeders = ntohl(resp.seeders);
+
+                if (resp.action == ACTION_ANNOUNCE && resp.transaction_id == tx_id) {
+                    printf("\nTracker Stats:\n");
+                    printf("  Seeders: %u\n", resp.seeders);
+                    printf("  Leechers: %u\n", resp.leechers);
+                    printf("  Interval: %u seconds\n", resp.interval);
+
+                    // Parse peer list
+                    size_t peer_data_size = n - sizeof(AnnounceResponse);
+
+                    if (peer_data_size % sizeof(Peer) != 0) {
+                        fprintf(stderr, "Malformed peer list\n");
+                        return -1;
+                    }
+
+
+                    size_t num_peers = peer_data_size / sizeof(Peer);
+
+                    if (num_peers > 0) {
+                        Peer *peer_list = (Peer*)(buffer + sizeof(AnnounceResponse));
+                        Peer *peers = arena_alloc(arena, num_peers * sizeof(Peer));
+                        memcpy(peers, peer_list, num_peers * sizeof(Peer));
+
+                        *peers_out = peers;
+                        *peer_count_out = num_peers;
+                    } else {
+                        *peers_out = NULL;
+                        *peer_count_out = 0;
+                    }
+
+                    printf("Announce successful!\n");
+                    return 0;
+                }
+            }
+        }
+
+        printf("Announce attempt failed\n");
+        timeout *= 2;
     }
 
-    AnnounceResponse *resp = (AnnounceResponse*)buffer;
-    resp->action = ntohl(resp->action);
-    resp->transaction_id = ntohl(resp->transaction_id);
-    resp->interval = ntohl(resp->interval);
-    resp->leechers = ntohl(resp->leechers);
-    resp->seeders = ntohl(resp->seeders);
-
-    if (resp->action == ACTION_ERROR) {
-        fprintf(stderr, "Tracker error: %.*s\n", (int)(n - 8), buffer + 8);
-        return -1;
-    }
-
-    if (resp->action != ACTION_ANNOUNCE) {
-        fprintf(stderr, "Invalid action in announce response\n");
-        return -1;
-    }
-
-    printf("\nTracker Stats:\n");
-    printf("  Seeders: %u\n", resp->seeders);
-    printf("  Leechers: %u\n", resp->leechers);
-    printf("  Interval: %u seconds\n", resp->interval);
-
-    // Parse peer list
-    size_t peer_data_size = n - sizeof(AnnounceResponse);
-    size_t num_peers = peer_data_size / sizeof(Peer);
-
-    if (num_peers > 0) {
-        Peer *peer_list = (Peer*)(buffer + sizeof(AnnounceResponse));
-        Peer *peers = arena_alloc(arena, num_peers * sizeof(Peer));
-        memcpy(peers, peer_list, num_peers * sizeof(Peer));
-
-        *peers_out = peers;
-        *peer_count_out = num_peers;
-    } else {
-        *peers_out = NULL;
-        *peer_count_out = 0;
-    }
-
-    return 0;
+    fprintf(stderr, "Announce failed after retries\n");
+    return -1;
 }
 
 // Main tracker communication function
