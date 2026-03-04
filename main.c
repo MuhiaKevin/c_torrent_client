@@ -824,6 +824,27 @@ typedef struct {
     int port;
 } TrackerURL;
 
+
+
+int wait_for_response(socket_t sock, int timeout_seconds) {
+    fd_set readfs;
+    struct timeval tv;
+
+    FD_ZERO(&readfs);
+    FD_SET(sock, &readfs);
+
+    tv.tv_sec = timeout_seconds;
+    tv.tv_usec = 0;
+
+    int ret = select(sock + 1, &readfs, NULL, NULL, &tv);
+
+    if (ret == 0) return 0;   // timeout
+    if (ret < 0) return -1;   // error
+    return 1;                 // ready
+}
+
+
+
 int parse_tracker_url(const char *url, TrackerURL *out) {
     // Expected format: udp://hostname:port/announce
     if (strncmp(url, "udp://", 6) != 0) {
@@ -884,61 +905,59 @@ void generate_peer_id(u8 peer_id[20]) {
 
 // Step 1: Connect to tracker
 int tracker_connect(socket_t sock, struct sockaddr_in *tracker_addr, u64 *connection_id) {
-    ConnectRequest req = {0};
-    /*req.protocol_id = htobe64_custom(PROTOCOL_ID);*/
-    req.protocol_id = swap64(PROTOCOL_ID);
-    req.action = htonl(ACTION_CONNECT);
-    req.transaction_id = htonl(random_transaction_id());
-
-    printf("Sending connect request...\n");
-    if (sendto(sock, (char*)&req, sizeof(req), 0, 
-               (struct sockaddr*)tracker_addr, sizeof(*tracker_addr)) < 0) {
-        perror("sendto failed");
-        return -1;
-    }
-
-    // Wait for response (with timeout)
-    fd_set readfds;
-    struct timeval tv;
-    tv.tv_sec = 15;
-    tv.tv_usec = 0;
-
-    FD_ZERO(&readfds);
-    FD_SET(sock, &readfds);
-
-    int ret = select(sock + 1, &readfds, NULL, NULL, &tv);
-    if (ret <= 0) {
-        fprintf(stderr, "Connect timeout or error\n");
-        return -1;
-    }
-
-    ConnectResponse resp = {0};
+    const int max_retries = 5;
+    int timeout = 5; 
     socklen_t addr_len = sizeof(*tracker_addr);
-    ssize_t n = recvfrom(sock, (char*)&resp, sizeof(resp), 0, 
-                         (struct sockaddr*)tracker_addr, &addr_len);
 
-    if (n < (ssize_t)sizeof(resp)) {
-        fprintf(stderr, "Invalid connect response size\n");
-        return -1;
+    // unlike in TCP where it automatically handles connection retries, in UDP we have to do it on your own
+    for(int attempt = 0;  attempt < max_retries; attempt++) {
+        // preparet Connect message struct 
+        ConnectRequest req = {0};
+        req.protocol_id = swap64(PROTOCOL_ID);
+        req.action = htonl(ACTION_CONNECT);
+        u32 tx_id = random_transaction_id();
+        req.transaction_id = htonl(tx_id);
+
+        printf("Sending connect request...\n");
+        if (sendto(sock, (char*)&req, sizeof(req), 0, (struct sockaddr*)tracker_addr, sizeof(*tracker_addr)) < 0) {
+            perror("sendto failed");
+            return -1;
+        }
+
+        int wait = wait_for_response(sock, timeout);
+
+        // if wait == 1 then then the request was successful and we can begin to serialize the respnse
+        if(wait == 1) { 
+            ConnectResponse resp = {0};
+            ssize_t n = recvfrom(sock, (char*)&resp, sizeof(resp), 0, (struct sockaddr*)tracker_addr, &addr_len);
+
+            // if packet received is less than than the Connect response size then not valid Connect Response
+            if (n < (ssize_t)sizeof(resp)) {
+                fprintf(stderr, "Invalid connect response size\n");
+                return -1;
+            }
+
+            // if greater then get connection ID
+            if (n >= (ssize_t)sizeof(resp)) {
+                resp.action = ntohl(resp.action);
+                resp.transaction_id = ntohl(resp.transaction_id);
+                resp.connection_id = be64toh_custom(resp.connection_id);
+
+                if(resp.action == ACTION_CONNECT && resp.transaction_id  == tx_id) {
+                    // get connection ID to be used for the next udp communication 
+                    *connection_id = resp.connection_id;
+                    printf("Connected! Connection ID: %llx\n", (unsigned long long)*connection_id);
+                    return 0;
+                }
+            }
+        }
+
+        printf("Connect attempt failed\n");
+        timeout *= 2;  // exponential backoff
     }
 
-    resp.action = ntohl(resp.action);
-    resp.transaction_id = ntohl(resp.transaction_id);
-    resp.connection_id = be64toh_custom(resp.connection_id);
-
-    if (resp.action != ACTION_CONNECT) {
-        fprintf(stderr, "Invalid action in response\n");
-        return -1;
-    }
-
-    if (resp.transaction_id != ntohl(req.transaction_id)) {
-        fprintf(stderr, "Transaction ID mismatch\n");
-        return -1;
-    }
-
-    *connection_id = resp.connection_id;
-    printf("Connected! Connection ID: %llx\n", (unsigned long long)*connection_id);
-    return 0;
+    fprintf(stderr, "Connect failed after retries\n");
+    return -1;
 }
 
 // Step 2: Announce to tracker
