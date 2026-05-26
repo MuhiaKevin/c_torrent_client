@@ -1132,6 +1132,28 @@ int communicate_with_tracker(const char *tracker_url, const u8 info_hash[20], Ar
 }
 
 
+
+
+void get_filenames(BcodeNode *info_dict) {
+    BcodeNode *files = dict_get(info_dict, "files");
+    if (files && files->type == BCODE_LIST) {
+        for(size_t i = 0; i < files->list_val.count; i++) {
+            BcodeNode *file_path = dict_get(files->list_val.items[i], "path");
+            if (file_path && file_path->type == BCODE_LIST) {
+                for(size_t i = 0; i < file_path->list_val.count; i++) {
+                    BcodeNode *real_path = file_path->list_val.items[i];
+                    if (real_path && real_path->type == BCODE_STRING) {
+                        printf("%s\n", real_path->string_val.data);
+                    }
+                }
+            }
+
+        }
+
+    }
+
+}
+
 int main(int argc, char **argv) {
     if(argc < 2) {
         fprintf(stderr, "Usage: %s <filename>\n", argv[0]);
@@ -1179,6 +1201,19 @@ int main(int argc, char **argv) {
     // Uncomment to see full structure
     // print_bcode(root, 0);
     /*split_pieces(root, &arena);*/
+
+
+
+    BcodeNode *info_dict = dict_get(root, "info");
+    if (info_dict && info_dict->type == BCODE_DICT) {
+        // get file name
+        BcodeNode *file_name = dict_get(info_dict, "name");
+        if (file_name && file_name->type == BCODE_STRING) {
+            printf("File Name by: %s\n\n", file_name->string_val.data);
+        }
+        get_filenames(info_dict);
+    }
+
 
 
     // Get tracker URL
