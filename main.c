@@ -162,6 +162,32 @@ typedef enum {
     BCODE_DICT
 } BcodeType;
 
+
+
+const char* bcode_type_to_string(BcodeType type) {
+    switch (type) {
+        case BCODE_INT:
+            return "INT";
+
+        case BCODE_STRING:
+            return "STRING";
+
+        case BCODE_LIST:
+            return "LIST";
+
+        case BCODE_DICT:
+            return "DICT";
+
+        default:
+            return "UNKNOWN";
+    }
+}
+
+void print_bcode_type(BcodeType type) {
+    printf("%s\n", bcode_type_to_string(type));
+}
+
+
 typedef struct BcodeNode BcodeNode;
 
 struct BcodeNode {
