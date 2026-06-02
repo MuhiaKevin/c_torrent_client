@@ -145,14 +145,6 @@ typedef struct {
 
 
 
-typedef struct {
-    u8 *buffer;
-    size_t capacity;
-    size_t pos;
-    Arena *arena;
-} Encoder;
-
-
 // Add these to your main file after the existing typedefs
 
 typedef enum {
@@ -192,6 +184,9 @@ typedef struct BcodeNode BcodeNode;
 
 struct BcodeNode {
     BcodeType type;
+    size_t start_offset;
+    size_t end_offset;
+
     union {
         i64 int_val;
         struct {
@@ -233,8 +228,6 @@ typedef struct {
 // Forward declaration
 BcodeNode* parse_value(Parser *p);
 
-// Forward declaration
-void encode_node(Encoder *enc, BcodeNode *node);
 
 // Parse integer: i<number>e
 BcodeNode* parse_int(Parser *p) {
@@ -394,19 +387,28 @@ BcodeNode* parse_dict(Parser *p) {
     return node;
 }
 
-// Main parser
+
+
+// Record position in parse_value before dispatching:
 BcodeNode* parse_value(Parser *p) {
     if (p->pos >= p->len) return NULL;
-    
+
+    size_t start = p->pos;  // record start
+
     u8 c = p->data[p->pos];
-    
-    if (c == 'i') return parse_int(p);
-    if (c == 'l') return parse_list(p);
-    if (c == 'd') return parse_dict(p);
-    if (isdigit(c)) return parse_string(p);
-    
-    fprintf(stderr, "Unknown token: %c\n", c);
-    return NULL;
+    BcodeNode *node = NULL;
+
+    if (c == 'i') node = parse_int(p);
+    else if (c == 'l') node = parse_list(p);
+    else if (c == 'd') node = parse_dict(p);
+    else if (isdigit(c)) node = parse_string(p);
+
+    if (node) {
+        node->start_offset = start;
+        node->end_offset = p->pos;  // parser has advanced past the node
+    }
+
+    return node;
 }
 
 // Helper: Find value in dictionary
@@ -650,94 +652,14 @@ void hexdump_ascii(const u8 *data, size_t len) {
 }
 
 
-
-void encode_ensure(Encoder *enc, size_t needed) {
-    if (enc->pos + needed > enc->capacity) {
-        size_t new_cap = enc->capacity * 2;
-        while (new_cap < enc->pos + needed) {
-            new_cap *= 2;
-        }
-        u8 *new_buf = arena_alloc(enc->arena, new_cap);
-        memcpy(new_buf, enc->buffer, enc->pos);
-        enc->buffer = new_buf;
-        enc->capacity = new_cap;
-    }
-} 
-
-void encode_bytes(Encoder *enc, const u8 *data, size_t len) {
-    encode_ensure(enc, len);
-    memcpy(enc->buffer + enc->pos, data, len);
-    enc->pos += len;
-}
-
-void encode_str(Encoder *enc, const char *str) {
-    encode_bytes(enc, (const u8*)str, strlen(str));
-}
-
-void encode_list(Encoder *enc, BcodeNode *node) {
-    encode_str(enc, "l");
-    for (size_t i = 0; i < node->list_val.count; i++) {
-        encode_node(enc, node->list_val.items[i]);
-    }
-    encode_str(enc, "e");
-} 
-void encode_string(Encoder *enc, u8 *data, size_t len) {
-    char buf[32];
-    int prefix_len = snprintf(buf, sizeof(buf), "%zu:", len);
-    encode_bytes(enc, (u8*)buf, prefix_len);
-    encode_bytes(enc, data, len);
-}
-
-void encode_dict(Encoder *enc, BcodeNode *node) {
-    encode_str(enc, "d");
-    for (size_t i = 0; i < node->dict_val.count; i++) {
-        encode_node(enc, node->dict_val.keys[i]);
-        encode_node(enc, node->dict_val.values[i]);
-    }
-    encode_str(enc, "e");
-}
-
-void encode_int(Encoder *enc, i64 val) {
-    char buf[32];
-    int len = snprintf(buf, sizeof(buf), "i%llde", (long long)val);
-    encode_bytes(enc, (u8*)buf, len);
-} 
-
-
-void encode_node(Encoder *enc, BcodeNode *node) {
-    switch (node->type) {
-        case BCODE_INT:
-            encode_int(enc, node->int_val);
-            break;
-        case BCODE_STRING:
-            encode_string(enc, node->string_val.data, node->string_val.len);
-            break;
-        case BCODE_LIST:
-            encode_list(enc, node);
-            break;
-        case BCODE_DICT:
-            encode_dict(enc, node);
-            break;
-    }
-
-}
-
-// Calculate SHA-1 hash of the info dictionary
-void calculate_info_hash(BcodeNode *info, u8 hash[20], Arena *arena) {
-    Encoder enc;
-
-    enc.capacity = 4096;
-    enc.buffer = arena_alloc(arena, enc.capacity);
-    enc.pos = 0;
-    enc.arena = arena;
-
-    encode_node(&enc, info);
-    
-    SHA1(enc.buffer, enc.pos, hash);
+void calculate_info_hash(BcodeNode *info, const u8 *source_bytes, u8 hash[20]) {
+    memset(hash, 0, 20);
+    size_t len = info->end_offset - info->start_offset;
+    SHA1(source_bytes + info->start_offset, len, hash);
 }
 
 
-TorrentFile  buildTorrentFile(BcodeNode *root, Arena *arena) {
+TorrentFile  buildTorrentFile(Buffer *torrent, BcodeNode *root, Arena *arena) {
     TorrentFile torrentFile = {0};
 
     // Extract some info
@@ -750,9 +672,8 @@ TorrentFile  buildTorrentFile(BcodeNode *root, Arena *arena) {
     BcodeNode *info = dict_get(root, "info");
     if (info && info->type == BCODE_DICT) {
 
-        u8 info_hash[20];
-        calculate_info_hash(info, info_hash, arena);
-        memcpy(torrentFile.info_hash, info_hash, 20);
+        calculate_info_hash(info, torrent->data, torrentFile.info_hash);
+
 
         /*printf("info_hash: ");*/
         /*print_single_hash((u8 *)&info_hash);*/
@@ -1220,7 +1141,7 @@ int main(int argc, char **argv) {
     }
 
 
-    TorrentFile torrentFile = buildTorrentFile(root, &arena);
+    TorrentFile torrentFile = buildTorrentFile(&torrent, root, &arena);
     /*printf("%s\n", torrentFile.name);*/
     /*print_single_hash(torrentFile.info_hash);*/
 
