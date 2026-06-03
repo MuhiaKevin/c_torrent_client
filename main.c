@@ -1,19 +1,21 @@
 #include <openssl/sha.h>
 
-#ifdef _WIN32
+#ifdef _WIN32 // “If we are compiling on Windows… then use these header files
+// Everything inside this block is Windows-specific.
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <stdio.h>
 #include <stdint.h>
 #include <winsock2.h>
 #include <ws2tcpip.h>
-#pragma comment(lib, "ws2_32.lib")
+#pragma comment(lib, "ws2_32.lib") // This tells MSVC (Windows compiler): “Link against the Winsock library automatically.
 
 typedef SOCKET socket_t;
 #define INVALID_SOCKET_VALUE INVALID_SOCKET
 #define close_socket closesocket
 #include "arena.h"
 #else
+// If not Windows, this part is used.
 #include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
