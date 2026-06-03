@@ -656,6 +656,12 @@ void calculate_info_hash(BcodeNode *info, const u8 *source_bytes, u8 hash[20]) {
     memset(hash, 0, 20);
     size_t len = info->end_offset - info->start_offset;
     SHA1(source_bytes + info->start_offset, len, hash);
+
+    /*printf("info hash: ");*/
+    /*for(size_t i = 0; i < 20; i++) {*/
+    /*    printf("%02x", hash[i]);*/
+    /*}*/
+    /*printf("\n");*/
 }
 
 
