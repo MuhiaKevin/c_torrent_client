@@ -274,8 +274,8 @@ typedef struct {
     u8 info_hash[20];
     u8 *name;
     Buffer *pieceHashes;
-    i64  piece_length ;
-    i64 length;
+    usize  piece_length ;
+    usize length;
     BcodeNode  *announce_list;
 }  TorrentFile;
 
@@ -1275,7 +1275,7 @@ u32 peer_connect(PeerConnection *peer, const u8 info_hash[20], const u8 peer_id[
 
 
 // Main tracker communication function
-int communicate_with_tracker(const char *tracker_url, const u8 info_hash[20], Arena *arena) {
+int communicate_with_tracker(const char *tracker_url, const u8 info_hash[20], Arena *arena, TorrentFile *torrent_file) {
     if (init_networking() < 0) {
         return -1;
     }
@@ -1351,6 +1351,8 @@ int communicate_with_tracker(const char *tracker_url, const u8 info_hash[20], Ar
             PeerConnection *peer_con = peer_cons[i];
 
             if (peer_connect(peer_con, info_hash, peer_id, arena) == 0) {
+                u8 *piece_data = arena_alloc(arena, torrent_file->piece_length);
+ 
                 // TODO: REMOVE:
                 exit(1);
             }
@@ -1462,7 +1464,7 @@ int main(int argc, char **argv) {
         printf("Tracker: %s\n\n", announce->string_val.data);
 
         // Communicate with tracker
-        communicate_with_tracker((char*)announce->string_val.data, torrentFile.info_hash, &arena);
+        communicate_with_tracker((char*)announce->string_val.data, torrentFile.info_hash, &arena, &torrentFile);
     }
 
 
