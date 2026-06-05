@@ -35,6 +35,7 @@ typedef SOCKET socket_t;
 #include <sys/time.h>
 #include <sys/types.h>
 #include <time.h>
+#include <errno.h>
 
 
 typedef int socket_t;
@@ -47,6 +48,7 @@ typedef uint8_t  u8;
 typedef uint16_t u16;
 typedef uint32_t u32;
 typedef uint64_t u64;
+typedef size_t usize ;
 
 typedef int8_t   i8;
 typedef int16_t  i16;
@@ -67,6 +69,7 @@ typedef int64_t  i64;
 #ifdef _WIN32
     #include <winsock2.h>
     #include <ws2tcpip.h>
+    #include <winerror.h>
     #pragma comment(lib, "ws2_32.lib")
     
     typedef SOCKET socket_t;
@@ -94,6 +97,9 @@ typedef int64_t  i64;
 #define ACTION_ANNOUNCE 1
 #define ACTION_SCRAPE   2
 #define ACTION_ERROR    3
+
+
+typedef struct BcodeNode BcodeNode;
 
 // Connect request/response
 typedef struct {
@@ -145,8 +151,6 @@ typedef struct {
 	size_t len;
 } Buffer;
 
-
-
 // Add these to your main file after the existing typedefs
 
 typedef enum {
@@ -177,12 +181,42 @@ const char* bcode_type_to_string(BcodeType type) {
     }
 }
 
+// *****************
+// HELPER FUNCTIONS
+// *****************
+
+void peer_ip_to_str(Peer *peer, char ip_str[20]) {
+    u32 ip = ntohl(peer->ip);
+
+    sprintf(ip_str, "%u.%u.%u.%u",
+            (ip >> 24) & 0xFF,
+            (ip >> 16) & 0xFF,
+            (ip >> 8) & 0xFF,
+            ip & 0xFF);
+}
+
+void print_peers(Peer *peers, size_t peer_count) {
+    printf("\nReceived %zu peers:\n", peer_count);
+    for (size_t i = 0; i < peer_count; i++) {  // Print first 10
+        u32 ip = ntohl(peers[i].ip);
+        u16 port = ntohs(peers[i].port);
+        printf("  %u.%u.%u.%u:%u\n",
+               (ip >> 24) & 0xFF,
+               (ip >> 16) & 0xFF,
+               (ip >> 8) & 0xFF,
+               ip & 0xFF,
+               port);
+    }
+}
+
 void print_bcode_type(BcodeType type) {
     printf("%s\n", bcode_type_to_string(type));
 }
 
+// *****************
+// HELPER FUNCTIONS
+// *****************
 
-typedef struct BcodeNode BcodeNode;
 
 struct BcodeNode {
     BcodeType type;
@@ -206,6 +240,24 @@ struct BcodeNode {
         } dict_val;
     };
 };
+
+
+typedef struct {
+    socket_t sock;
+    char ip[16];
+    u16 port;
+
+    // Connection state
+    u32 am_choking;
+    u32 am_interested;
+    u32 peer_choking;
+    u32 peer_interested;
+
+    u8 *bitfield;
+    usize bitfield_len;
+
+    time_t last_message_time;
+} PeerConnection;
 
 // Parser state
 typedef struct {
@@ -1014,6 +1066,146 @@ int tracker_announce(socket_t sock, struct sockaddr_in *tracker_addr, u64 connec
     return -1;
 }
 
+
+
+
+
+
+PeerConnection *peer_create(char ip[20], u16 port, Arena *arena) {
+    PeerConnection *peer = arena_alloc(arena, sizeof(PeerConnection));
+
+    memset(peer, 0, sizeof(PeerConnection));
+
+    // initialize peer conneciton struct
+    strncpy(peer->ip, ip, sizeof(peer->ip) - 1);
+    peer->port = port;
+    peer->am_choking = 1;
+    peer->am_interested = 0;
+    peer->peer_choking = 1;
+    peer->peer_interested = 0;
+    peer->last_message_time = time(NULL);
+
+    return peer;
+}
+
+// connect to peer
+// 1. if peer is connectable then connect to next peer
+//    get peer list instead and if timeout lapses then try connecting to next peer;
+
+
+
+// Step 1: Connect to peer and perform handshake
+u32 peer_connect(PeerConnection *peer, const u8 info_hash[20], const u8 peer_id[20]) {
+    printf("Connecting to peer %s:%u\n", peer->ip, peer->port);
+    
+    // Resolve IP
+    struct sockaddr_in addr = {0};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(peer->port);
+    
+    if (inet_pton(AF_INET, peer->ip, &addr.sin_addr) <= 0) {
+        fprintf(stderr, "Invalid IP address: %s\n", peer->ip);
+        return -1;
+    }
+    
+    // Create TCP socket
+    peer->sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (peer->sock == INVALID_SOCKET_VALUE) {
+        perror("socket");
+        return -1;
+    }
+    
+    int flags = fcntl(peer->sock, F_GETFL, 0);
+    if (flags == -1) {
+        perror("fcntl F_GETFL");
+        close_socket(peer->sock);
+        return -1;
+    }
+    if (fcntl(peer->sock, F_SETFL, flags & ~O_NONBLOCK) == -1) {
+        perror("fcntl F_SETFL");
+        close_socket(peer->sock);
+        return -1;
+    }
+    
+    struct timeval tv;
+    tv.tv_sec = 15;
+    tv.tv_usec = 0;
+    if (setsockopt(peer->sock, SOL_SOCKET, SO_RCVTIMEO, (struct timeval*)&tv, sizeof(tv)) < 0) {
+        perror("setsockopt SO_RCVTIMEO");
+    }
+    if (setsockopt(peer->sock, SOL_SOCKET, SO_SNDTIMEO, (struct timeval*)&tv, sizeof(tv)) < 0) {
+        perror("setsockopt SO_SNDTIMEO");
+    }
+
+    printf("Attempting connection (10 second timeout)...\n\n\n\n");
+    
+
+    flags = fcntl(peer->sock, F_GETFL, 0);
+    fcntl(peer->sock, F_SETFL, flags | O_NONBLOCK);
+    
+    int ret = connect(peer->sock, (struct sockaddr*)&addr, sizeof(addr));
+    
+    int error_code = errno;
+    int in_progress = (error_code == EINPROGRESS);
+    
+    // If connection is in progress or would block, wait with select
+    if (ret < 0 && in_progress) {
+        fd_set writefds, errorfds;
+        struct timeval tv;
+        tv.tv_sec = 2;
+        tv.tv_usec = 0;
+        
+        FD_ZERO(&writefds);
+        FD_ZERO(&errorfds);
+        FD_SET(peer->sock, &writefds);
+        FD_SET(peer->sock, &errorfds);
+        
+        ret = select((int)peer->sock + 1, NULL, &writefds, &errorfds, &tv);
+        
+        if (ret < 0) {
+            perror("select");
+            close_socket(peer->sock);
+            return -1;
+        } else if (ret == 0) {
+            fprintf(stderr, "Connection timeout\n");
+            close_socket(peer->sock);
+            return -1;
+        } else if (FD_ISSET(peer->sock, &errorfds)) {
+            fprintf(stderr, "Connection refused or failed\n");
+            close_socket(peer->sock);
+            return -1;
+        }
+        
+        // Connection succeeded, verify it with getsockopt
+        int connect_error = 0;
+        socklen_t len = sizeof(connect_error);
+        
+        if (getsockopt(peer->sock, SOL_SOCKET, SO_ERROR, (char*)&connect_error, &len) < 0) {
+            perror("getsockopt");
+            close_socket(peer->sock);
+            return -1;
+        }
+        
+        if (connect_error != 0) {
+            fprintf(stderr, "Connection failed: %s\n", strerror(connect_error));
+            close_socket(peer->sock);
+            return -1;
+        }
+    } else if (ret < 0) {
+        perror("connect");
+        close_socket(peer->sock);
+        return -1;
+    }
+    
+    flags = fcntl(peer->sock, F_GETFL, 0);
+    fcntl(peer->sock, F_SETFL, flags & ~O_NONBLOCK);
+    
+    printf("Connected! Sending handshake...\n");
+    printf("Connected to peer %s:%u\n", peer->ip, peer->port);
+    
+    return 0;
+}
+
 // Main tracker communication function
 int communicate_with_tracker(const char *tracker_url, const u8 info_hash[20], Arena *arena) {
     if (init_networking() < 0) {
@@ -1068,18 +1260,42 @@ int communicate_with_tracker(const char *tracker_url, const u8 info_hash[20], Ar
         return -1;
     }
 
-    // Print peer list
-    printf("\nReceived %zu peers:\n", peer_count);
-    for (size_t i = 0; i < peer_count; i++) {  // Print first 10
-        u32 ip = ntohl(peers[i].ip);
-        u16 port = ntohs(peers[i].port);
-        printf("  %u.%u.%u.%u:%u\n",
-               (ip >> 24) & 0xFF,
-               (ip >> 16) & 0xFF,
-               (ip >> 8) & 0xFF,
-               ip & 0xFF,
-               port);
+
+    if(peers && peer_count > 0) {
+        print_peers(peers, peer_count);
+
+        /*char *peer_ip[16];*/
+        /*peer_ip_to_str(&peers[0], peer_ip);*/
+        u8 peer_id[20];
+        generate_peer_id(peer_id);
+
+        PeerConnection **peer_cons = arena_alloc(arena, sizeof(PeerConnection *) * peer_count); // array of pointers
+
+        for(usize i = 0; i < peer_count; i++) {
+            char *peer_ip = arena_alloc(arena, 16);
+            peer_ip_to_str(&peers[i], peer_ip);
+
+            peer_cons[i] = peer_create(peer_ip, ntohs(peers[i].port), arena); // initialize
+        }
+
+
+        for(usize i = 0; i < peer_count; i++) {
+            PeerConnection *peer_con = peer_cons[i];
+
+            if (peer_connect(peer_con, info_hash, peer_id) == 0) {
+                return 0;
+            }
+        }
+
+        
+        /*PeerConnection *peer = peer_create(peer_ip, ntohs(peers[0].port), arena);*/
+        /**/
+        /*if (peer_connect(peer, info_hash, peer_id) == 0) {*/
+        /*}*/
     }
+
+
+
 
     close_socket(sock);
     cleanup_networking();
@@ -1166,7 +1382,7 @@ int main(int argc, char **argv) {
         if (file_name && file_name->type == BCODE_STRING) {
             printf("File Name by: %s\n\n", file_name->string_val.data);
         }
-        get_filenames(info_dict);
+        /*get_filenames(info_dict);*/
     }
 
 
