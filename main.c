@@ -1068,6 +1068,27 @@ int tracker_announce(socket_t sock, struct sockaddr_in *tracker_addr, u64 connec
 
 
 
+// total size is 68 bytes
+typedef struct {
+    u8 pstrlen; // 19 length of string "BitTorrent protocol"
+    u8 pstr[19]; // the string "BitTorrent protocol" 
+    u8 reserved[8]; // Feature flags, all zeros for now
+    u8 info_hash[20]; // SHA-1 hash of info dict
+    u8 peer_id[20]; // our peer ID
+} __attribute__((packed)) Handshake; // not packed bytes
+
+
+Handshake *build_handshake(Arena *arena, const u8 info_hash[20], const u8 peer_id[20]) {
+    Handshake *hs = arena_alloc(arena, sizeof(Handshake));
+
+    hs->pstrlen = 19;
+    memcpy(hs->pstr,  "BitTorrent protocol", 19);
+    memset(hs->reserved, 0, 8);
+    memcpy(hs->info_hash, info_hash, 20);
+    memcpy(hs->peer_id, peer_id, 20);
+
+    return hs;
+}
 
 
 
@@ -1095,7 +1116,7 @@ PeerConnection *peer_create(char ip[20], u16 port, Arena *arena) {
 
 
 // Step 1: Connect to peer and perform handshake
-u32 peer_connect(PeerConnection *peer, const u8 info_hash[20], const u8 peer_id[20]) {
+u32 peer_connect(PeerConnection *peer, const u8 info_hash[20], const u8 peer_id[20], Arena *arena) {
     printf("Connecting to peer %s:%u\n", peer->ip, peer->port);
     
     // Resolve IP
@@ -1202,9 +1223,56 @@ u32 peer_connect(PeerConnection *peer, const u8 info_hash[20], const u8 peer_id[
     
     printf("Connected! Sending handshake...\n");
     printf("Connected to peer %s:%u\n", peer->ip, peer->port);
-    
+
+
+      // Send handshake
+    // Handshake hs = {0};
+    // hs.pstrlen = 19;
+    // memcpy(hs.pstr, "BitTorrent protocol", 19);
+    // memset(hs.reserved, 0, 8);
+    // memcpy(hs.info_hash, info_hash, 20);
+    // memcpy(hs.peer_id, peer_id, 20);
+    Handshake *hs = build_handshake(arena, info_hash, peer_id);
+
+    // if what is received from peer is not equal to size of handshake or 68 bytes then
+    if(send(peer->sock, (char*)hs, sizeof(Handshake), 0)  != sizeof(Handshake)) {
+        fprintf(stderr, "Failed to send handshake\n");
+        close_socket(peer->sock);
+        return -1;
+    }
+
+    //  Handshake hs_recv = {0};
+    Handshake *hs_recv = arena_alloc(arena, sizeof(Handshake));
+    memset(hs_recv, 0, sizeof(Handshake));
+
+    isize n = recv(peer->sock, (char*)hs_recv, sizeof(Handshake), 0);
+
+    if(n != sizeof(Handshake)) {
+        fprintf(stderr, "Failed to receive handshake (got %zu bytes)\n", n);
+        close_socket(peer->sock);
+        return -1;
+    }
+
+
+    if (hs_recv->pstrlen != 19 || memcmp(hs_recv->pstr, "BitTorrent protocol", 19) != 0) {
+        fprintf(stderr, "Failed to receive handshake (got %zu bytes)\n", n);
+        close_socket(peer->sock);
+        return -1;
+    }
+
+
+
+    if (memcmp(hs_recv->info_hash, info_hash, 20) != 0) {
+        fprintf(stderr, "Info hash mismatch!\n");
+        close_socket(peer->sock);
+        return -1;
+    }
+
+    printf("Handshake successful!\n");
+    peer->last_message_time = time(NULL);
     return 0;
 }
+
 
 // Main tracker communication function
 int communicate_with_tracker(const char *tracker_url, const u8 info_hash[20], Arena *arena) {
@@ -1282,8 +1350,9 @@ int communicate_with_tracker(const char *tracker_url, const u8 info_hash[20], Ar
         for(usize i = 0; i < peer_count; i++) {
             PeerConnection *peer_con = peer_cons[i];
 
-            if (peer_connect(peer_con, info_hash, peer_id) == 0) {
-                return 0;
+            if (peer_connect(peer_con, info_hash, peer_id, arena) == 0) {
+                // TODO: REMOVE:
+                exit(1);
             }
         }
 
