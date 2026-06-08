@@ -57,6 +57,87 @@ A length of 0 is a special case — it means keep-alive, which has no type byte 
 A Keep-alive messages are is just a heartbeat so the connection doesn't time out.  
 
 
+
+In the first 4 bytes of every bittorent protocol message, by **putting the length
+of what follows at the start of every message**, the receiver always knows
+exactly how many bytes to read: 
+
+
+A keep-alive is just [00 00 00 00] — four zero bytes. Length of zero means
+nothing follows, not even a type byte. It's the minimum valid message — just
+enough to keep the TCP connection alive without saying anything.
+
+
+So the 4 byte length prefix isn't a BitTorrent invention specifically — it's a
+standard solution to TCP message framing that you'll see in almost every binary
+protocol built on top of TCP.
+
+
+
+
+HAVE message is specifically used to announce:
+
+    "I have successfully downloaded and verified piece X."
+
+
+
+So if a peer finishes downloading a piece while you're connected to it, it can immediately send: 
+
+    <length=0005><id=4><piece index> 
+
+
+
+The peer can send you a have message even if you're currently doing something else, such as:
+
+        processing the handshake,
+
+        exchanging bitfields,
+
+        requesting blocks,
+
+        receiving piece data,
+
+        waiting for an unchoke.
+
+
+The HAVE message is asynchronous and serves as a notification that the peer's piece set has changed 
+
+## TCP in userland and kernel land
+
+
+When the peer sends a message, they call something like: 
+
+
+```C
+
+    send(sock, message, total_size, 0);
+
+```
+
+From userland side, those bytes **arrive as a continuous stream in the kernel's receive buffer**
+
+
+Kernel doesn't know or care about your message boundaries just buffers bytes as they arrive 
+
+
+When you call recv for the length, the kernel very likely already has the entire message buffered 
+
+
+
+**recv DOESN'T TRIGGER A NETWORK RECEIVE** — it just **COPIES BYTES OUT OF THE KERNEL BUFFER INTO YOUR BUFFER**:
+
+
+Kernel just advances a read pointer each time.  
+
+
+Think of it like reading a file — each read() picks up where the last one left off.
+
+
+The **MSG_WAITALL flag** tells the kernel "don't return until you have all msg_len bytes or an error". It essentially does the loop for you.
+ 
+
+Loop is still more portable and explici 
+
 ## TCP
 
 TCP packet with the flags RST, ACK set means:

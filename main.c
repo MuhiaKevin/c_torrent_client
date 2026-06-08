@@ -176,6 +176,7 @@ const char* bcode_type_to_string(BcodeType type) {
         case BCODE_DICT:
             return "DICT";
 
+
         default:
             return "UNKNOWN";
     }
@@ -277,6 +278,7 @@ typedef struct {
     usize  piece_length ;
     usize length;
     BcodeNode  *announce_list;
+    u32 num_pieces;
 }  TorrentFile;
 
 // Forward declaration
@@ -487,7 +489,7 @@ void print_single_hash(u8 *hash_ptr) {  // hash_ptr points to start of one 20-by
 }
 
 
-Buffer *split_pieces(BcodeNode *root, Arena *arena) {
+Buffer *split_pieces(BcodeNode *root, Arena *arena, TorrentFile *torrent_file) {
     // create a buffer for the pieces
     Buffer *pieces_buffer = {0};
 
@@ -511,6 +513,7 @@ Buffer *split_pieces(BcodeNode *root, Arena *arena) {
                 memcpy((hashes + i * hash_len), pieces->string_val.data + i * hash_len, hash_len);
             }
             pieces_buffer->data = hashes;
+            torrent_file->num_pieces = num_hashes;
 
             /*printf("pieces length %zu\n", pieces_buffer->len);*/
 
@@ -770,7 +773,7 @@ TorrentFile  buildTorrentFile(Buffer *torrent, BcodeNode *root, Arena *arena) {
     }
 
 
-    Buffer *pieceHashes = split_pieces(root, arena);
+    Buffer *pieceHashes = split_pieces(root, arena, &torrentFile);
     torrentFile.pieceHashes = pieceHashes;
     torrentFile.announce_list = announce_list;
 
@@ -916,6 +919,7 @@ int tracker_connect(socket_t sock, struct sockaddr_in *tracker_addr, u64 *connec
     socklen_t addr_len = sizeof(*tracker_addr);
 
     // unlike in TCP where it automatically handles connection retries, in UDP we have to do it on your own
+
     for(int attempt = 0;  attempt < max_retries; attempt++) {
         // preparet Connect message struct 
         ConnectRequest req = {0};
@@ -1114,9 +1118,198 @@ PeerConnection *peer_create(char ip[20], u16 port, Arena *arena) {
 //    get peer list instead and if timeout lapses then try connecting to next peer;
 
 
+// Message types
+typedef enum {
+    MSG_KEEP_ALIVE = -1,
+    MSG_CHOKE = 0,
+    MSG_UNCHOKE = 1,
+    MSG_INTERESTED = 2,
+    MSG_NOT_INTERESTED = 3,
+    MSG_HAVE = 4,
+    MSG_BITFIELD = 5,
+    MSG_REQUEST = 6,
+    MSG_PIECE = 7,
+    MSG_CANCEL = 8,
+    MSG_PORT = 9
+} MessageType;
+
+
+
+// Add this helper function to check if peer has a specific piece
+int peer_has_piece(PeerConnection *peer, u32 piece_index) {
+    if (!peer->bitfield) return 0;
+    
+    u32 byte_idx = piece_index / 8;
+    u32 bit_idx = 7 - (piece_index % 8);  // BitTorrent uses big-endian bit ordering
+    
+    if (byte_idx >= peer->bitfield_len) return 0;
+    
+    return (peer->bitfield[byte_idx] >> bit_idx) & 1;
+}
+
+
+// Print bitfield for debugging
+void print_bitfield(PeerConnection *peer, u32 total_pieces) {
+    printf("Bitfield visualization (first 80 pieces):\n");
+    for (u32 i = 0; i < total_pieces && i < 80; i++) {
+        printf("%c", peer_has_piece(peer, i) ? '#' : '.');
+        if ((i + 1) % 40 == 0) printf("\n");
+    }
+    printf("\n");
+}
+
+// Receive a message from peer
+// Typical Bittorent peer message strucuture: [4 bytes: length][1 byte: type][N bytes: payload]
+int peer_recv_message(PeerConnection *peer, u8 *type_out, u8 *payload, u32 *payload_len_out, u32 max_payload) {
+    // Read length field (4 bytes)
+    u8 len_bytes[4];
+    // copy  4 bytes of the bittorent message to the len bytes buffer
+    // this moves the kernel pointer up to 4 bytes 
+    // subsequent recv will copy from  from message type and payload
+    ssize_t n = recv(peer->sock, (char*)len_bytes, 4, 0);
+    if (n != 4) {
+        if (n == 0) {
+            printf("Peer closed connection\n");
+        } else if (n < 0) {
+            perror("recv");
+        } else {
+            fprintf(stderr, "Incomplete length field\n");
+        }
+        return -1;
+    }
+    
+    u32 msg_len = ntohl(*(u32*)len_bytes);
+    
+    // Keep-alive message (length = 0)
+    // A length of 0 is a special case — it means keep-alive, which has no type byte and no payload
+    // the next message might be a keep alive message and not necessarily a bitfield message so make sure you handle that
+    if (msg_len == 0) {
+        *payload_len_out = 0;
+        *type_out = MSG_KEEP_ALIVE;
+        peer->last_message_time = time(NULL);
+        return 0;
+    }
+    
+    // Read type + payload
+    // this is just there to make sure that the bitfield message is not larger than the size we allocated to store the bitfield, the +1 is the byte for the message type
+    if (msg_len > max_payload + 1) {
+        fprintf(stderr, "Message too large: %u bytes\n", msg_len);
+        return -1;
+    }
+    
+    // create space to store the bitfield
+    u8 buffer[msg_len];
+    // to track the amount we have copied
+    size_t total = 0;
+
+    // receive and copy  the message to buffer
+    while (total < msg_len) {
+        n = recv(peer->sock, (char*)buffer + total, msg_len - total, 0);
+        if (n <= 0) {
+            fprintf(stderr, "Connection closed or error\n");
+            return -1;
+        }
+        total += n;
+    }
+    
+    // save the message type
+    *type_out = buffer[0];
+
+
+    // for the payload received
+    *payload_len_out = msg_len - 1;
+    if (*payload_len_out > 0) {
+        memcpy(payload, buffer + 1, *payload_len_out);
+    }
+    
+    peer->last_message_time = time(NULL);
+    return 0;
+}
+
+// Count how many pieces the peer has
+u32 peer_count_pieces(PeerConnection *peer) {
+    if (!peer->bitfield) return 0;
+    
+    u32 count = 0;
+    for (size_t i = 0; i < peer->bitfield_len * 8; i++) {
+        if (peer_has_piece(peer, i)) {
+            count++;
+        }
+    }
+    return count;
+}
+
+// Receive and parse bitfield message
+int peer_receive_bitfield(PeerConnection *peer, u32 expected_pieces, Arena *arena) {
+    printf("Waiting for bitfield message...\n");
+    
+    u8 msg_type;
+    u8 payload[8192];  // Bitfield can be large for torrents with many pieces
+    u32 payload_len;
+    
+    // Set a timeout for receiving bitfield
+    int timeout_attempts = 0;
+    while (timeout_attempts < 10) {
+        if (peer_recv_message(peer, &msg_type, payload, &payload_len, sizeof(payload)) < 0) {
+            timeout_attempts++;
+            continue;
+        }
+        
+        if (msg_type == MSG_BITFIELD) {
+            printf("✓ Received bitfield message (%u bytes)\n", payload_len);
+            
+            // Validate bitfield size
+            // Bitfield should be ceil(num_pieces / 8) bytes
+            u32 expected_bitfield_len = (expected_pieces + 7) / 8;
+            
+            if (payload_len < expected_bitfield_len) {
+                fprintf(stderr, "Warning: Bitfield smaller than expected (%u < %u)\n", 
+                        payload_len, expected_bitfield_len);
+            }
+            
+            if (payload_len > expected_bitfield_len) {
+                fprintf(stderr, "Warning: Bitfield larger than expected (%u > %u)\n", 
+                        payload_len, expected_bitfield_len);
+            }
+            
+            // Store bitfield
+            peer->bitfield = arena_alloc(arena, payload_len);
+            memset(peer->bitfield, 0, payload_len);
+            memcpy(peer->bitfield, payload, payload_len);
+            peer->bitfield_len = payload_len;
+            
+            printf("Bitfield hexdump");
+            hexdump_ascii(peer->bitfield, payload_len);
+            // Count pieces
+            u32 pieces_count = peer_count_pieces(peer);
+            printf("  Peer has %u/%u pieces\n", pieces_count, expected_pieces);
+            
+            return 0;
+            
+        } else if (msg_type == MSG_KEEP_ALIVE) {
+            // Ignore keep-alive
+            continue;
+            
+            // MSG_HAVE means the peer just finished downloading a piece and is announcing it. 
+        } else if (msg_type == MSG_HAVE) {
+            // Some peers may send HAVE messages instead of/before bitfield
+            printf("Note: Peer sent HAVE message before bitfield\n");
+            timeout_attempts++;
+            continue;
+        } else {
+            printf("Unexpected message before bitfield: type=%u\n", msg_type);
+            timeout_attempts++;
+            continue;
+        }
+    }
+    
+    fprintf(stderr, "Timeout waiting for bitfield\n");
+    return -1;
+}
+
 
 // Step 1: Connect to peer and perform handshake
-u32 peer_connect(PeerConnection *peer, const u8 info_hash[20], const u8 peer_id[20], Arena *arena) {
+u32 peer_connect(PeerConnection *peer, const u8 info_hash[20], const u8 peer_id[20], Arena *arena, u32 num_pieces) {
     printf("Connecting to peer %s:%u\n", peer->ip, peer->port);
     
     // Resolve IP
@@ -1268,7 +1461,14 @@ u32 peer_connect(PeerConnection *peer, const u8 info_hash[20], const u8 peer_id[
         return -1;
     }
 
-    printf("Handshake successful!\n");
+    printf("✓ Handshake successful! Connected to peer %s:%u\n", peer->ip, peer->port);
+
+
+    // Afer receiving a handshake you may receive bitfield message which is an arry of bytes of the pieces the peers have 
+    // Each bit in the byte array states whether the peer has a piece or not which we will use to ask the piece from a peer
+
+    peer_receive_bitfield(peer, num_pieces, arena);
+    
     peer->last_message_time = time(NULL);
     return 0;
 }
@@ -1322,6 +1522,7 @@ int communicate_with_tracker(const char *tracker_url, const u8 info_hash[20], Ar
     // Step 2: Announce
     Peer *peers = NULL;
     size_t peer_count = 0;
+
     if (tracker_announce(sock, &tracker_addr, connection_id, info_hash, &peers, &peer_count, arena) < 0) {
         close_socket(sock);
         cleanup_networking();
@@ -1350,7 +1551,7 @@ int communicate_with_tracker(const char *tracker_url, const u8 info_hash[20], Ar
         for(usize i = 0; i < peer_count; i++) {
             PeerConnection *peer_con = peer_cons[i];
 
-            if (peer_connect(peer_con, info_hash, peer_id, arena) == 0) {
+            if (peer_connect(peer_con, info_hash, peer_id, arena, torrent_file->num_pieces) == 0) {
                 u8 *piece_data = arena_alloc(arena, torrent_file->piece_length);
  
                 // TODO: REMOVE:
