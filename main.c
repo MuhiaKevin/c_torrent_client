@@ -1136,6 +1136,10 @@ typedef enum {
 
 
 // Add this helper function to check if peer has a specific piece
+// STEP 1: Divide the piece index by 8 to get the byte index
+// STEP 2: GET the bit index of the piece index 
+// STEP 3: SHIFT the byte from the bit index to the right using >> (bit index) 
+// STEP 4: Mask with & 1; Result will be either 1(peer has a piece) or 0(peer has no piece)
 int peer_has_piece(PeerConnection *peer, u32 piece_index) {
     if (!peer->bitfield) return 0;
     
