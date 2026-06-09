@@ -102,6 +102,91 @@ The peer can send you a have message even if you're currently doing something el
 
 The HAVE message is asynchronous and serves as a notification that the peer's piece set has changed 
 
+
+
+
+### Extracting the bit value for a piece index in the bitfield
+
+Bitfield message is sent as [4 bytes length prefix][1 byte message type][bitfield payload]
+
+
+The bitfield is a flat array of bytes. To check a specific piece you need to answer two questions: which byte is it in, and which bit within that byte.
+
+length tells the whole size of the payload, message type tells what message it is and payload is the bytes that tells what piece the peer has 
+
+
+After getting the payload these are the steps you take to know whether a peer has a piece or not
+
+
+1. Get what  byte the piece index is in  — **piece_index / 8**
+
+The answer will state what byte the piece index is in 
+
+Every byte holds 8 pieces. So:
+ 
+    piece 0-7   → byte 0
+    piece 8-15  → byte 1
+    piece 16-23 → byte 2
+    piece 24-31 → byte 3
+
+Dividing by 8 gives you the byte index:
+
+
+    piece 9:  9  / 8 = 1  → byte 1
+    piece 20: 20 / 8 = 2  → byte 2
+    piece 7:  7  / 8 = 0  → byte 0
+
+2. Question 2: which bit the piece index is in the byte from question 1. ** 7 - (piece_index % 8)**
+
+
+Within a byte, which of the 8 bits represents this piece? piece_index % 8 gives
+you the position within the byte, counting from 0:
+
+
+
+    piece 9:  9  % 8 = 1  → position 1 within byte 1
+
+    piece 20: 20 % 8 = 4  → position 4 within byte 2
+
+
+
+BitTorrent numbers bits from the most significant bit (leftmost), not the least significant (rightmost) 
+
+
+    byte 0:
+    bit position in byte:   0    1    2    3    4    5    6    7
+                           [p0] [p1] [p2] [p3] [p4] [p5] [p6] [p7]
+    actual bit index:        7    6    5    4    3    2    1    0
+                             ▲ MSB                           LSB ▲
+
+
+So piece 0 is at the MSB (bit 7), piece 7 is at the LSB (bit 0). The 7 - flips the position to account for this:
+
+
+    piece 0: 7 - (0 % 8) = 7 - 0 = 7  → bit 7 (MSB) ✓
+    piece 1: 7 - (1 % 8) = 7 - 1 = 6  → bit 6
+    piece 7: 7 - (7 % 8) = 7 - 7 = 0  → bit 0 (LSB) ✓
+    piece 8: 7 - (8 % 8) = 7 - 0 = 7  → bit 7 of byte 1 ✓
+
+
+3. Question 3. Extracting the bit
+ 
+
+Say piece 9, byte 1 contains 10110100:
+
+
+    bit_idx = 7 - (9 % 8) = 6
+
+    (10110100  >> 6) = 00000010 (& 00000001) = 00000000  → 0, peer doesn't have piece 9
+
+
+
+
+The & 1 at the end is the mask — after shifting, you only care about the lowest
+bit. Without it you'd get the shifted value which could be any number, not just
+0 or 1.
+
+
 ## TCP in userland and kernel land
 
 
