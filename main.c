@@ -99,6 +99,13 @@ typedef int64_t  i64;
 #define ACTION_ERROR    3
 
 
+
+// Peer protocol constants
+#define HANDSHAKE_LENGTH 68
+#define BLOCK_SIZE 16384  // 16 KB blocks
+#define REQUEST_TIMEOUT 30
+
+
 typedef struct BcodeNode BcodeNode;
 
 // Connect request/response
@@ -1120,7 +1127,7 @@ PeerConnection *peer_create(char ip[20], u16 port, Arena *arena) {
 
 // Message types
 typedef enum {
-    MSG_KEEP_ALIVE = -1,
+    MSG_KEEP_ALIVE = 20,
     MSG_CHOKE = 0,
     MSG_UNCHOKE = 1,
     MSG_INTERESTED = 2,
@@ -1171,14 +1178,28 @@ int peer_recv_message(PeerConnection *peer, u8 *type_out, u8 *payload, u32 *payl
     // this moves the kernel pointer up to 4 bytes 
     // subsequent recv will copy from  from message type and payload
     ssize_t n = recv(peer->sock, (char*)len_bytes, 4, 0);
-    if (n != 4) {
-        if (n == 0) {
-            printf("Peer closed connection\n");
-        } else if (n < 0) {
-            perror("recv");
-        } else {
-            fprintf(stderr, "Incomplete length field\n");
+    /*if (n != 4) {*/
+    /*    if (n == 0) {*/
+    /*        printf("Peer closed connection\n");*/
+    /*    } else if (n < 0) {*/
+    /*        perror("recv");*/
+    /*    } else {*/
+    /*        fprintf(stderr, "Incomplete length field\n");*/
+    /*    }*/
+    /*    return -1;*/
+    /*}*/
+
+
+    if (n < 0) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            // timeout expired, no data yet — not a real error
+            return -2;  // distinct return code for timeout
         }
+        perror("recv");
+        return -1;  // real error
+    }
+    if (n == 0) {
+        printf("Peer closed connection\n");
         return -1;
     }
     
@@ -1287,6 +1308,7 @@ int peer_receive_bitfield(PeerConnection *peer, u32 expected_pieces, Arena *aren
             // Count pieces
             u32 pieces_count = peer_count_pieces(peer);
             printf("  Peer has %u/%u pieces\n", pieces_count, expected_pieces);
+            print_bitfield(peer, expected_pieces);
             
             return 0;
             
@@ -1478,6 +1500,191 @@ u32 peer_connect(PeerConnection *peer, const u8 info_hash[20], const u8 peer_id[
 }
 
 
+// Send a message to peer
+int peer_send_message(PeerConnection *peer, u8 type, const u8 *payload, u32 payload_len) {
+    // Build message: [length (4 bytes)][type (1 byte)][payload]
+    u8 buffer[payload_len + 5];
+    u32 message_len = htonl(payload_len + 1);  // +1 for type byte
+    
+    memcpy(buffer, &message_len, 4);
+    buffer[4] = type;
+    if (payload_len > 0) {
+        memcpy(buffer + 5, payload, payload_len);
+    }
+    
+    if (send(peer->sock, (char*)buffer, sizeof(buffer), 0) != (ssize_t)sizeof(buffer)) {
+        perror("send");
+        return -1;
+    }
+    
+    peer->last_message_time = time(NULL);
+    return 0;
+}
+
+
+
+typedef struct {
+    u32 index;
+    u32 begin;
+    u32 length;
+
+} __attribute__((packed)) RequestMessage;
+
+
+typedef struct {
+    u32 index;
+    u32 begin;
+}__attribute__((packed)) PieceMessage;
+
+
+int peer_request_block(PeerConnection *peer, u32 piece_index, u32 block_offset, u32 block_size) {
+    RequestMessage req = {
+        .index = htonl(piece_index),
+        .begin = htonl(block_offset),
+        .length = htonl(block_size)
+    };
+    
+    return peer_send_message(peer, MSG_REQUEST, (u8*)&req, sizeof(req));
+}
+
+
+
+int peer_download_piece(PeerConnection *peer, u32 piece_index, u32 piece_size, u8 *piece_data) {
+    printf("\nDownloading piece %u from %s:%u\n", piece_index, peer->ip, peer->port);
+    
+    // Send interested message
+    if (peer_send_message(peer, MSG_INTERESTED, NULL, 0) < 0) {
+        fprintf(stderr, "Failed to send interested\n");
+        return -1;
+    }
+    peer->am_interested = 1;
+    
+    // Wait for unchoke
+    printf("Waiting for peer to unchoke...\n");
+    int got_unchoke = 0;
+    int timeout_count = 0;
+    
+    while (!got_unchoke && timeout_count < 30) {
+        u8 msg_type;
+        u8 payload[1024];
+        u32 payload_len;
+
+//        if (peer_recv_message(peer, &msg_type, payload, &payload_len, sizeof(payload)) < 0) {
+//            timeout_count++;
+//            continue;
+//        }
+
+        int result = peer_recv_message(peer, &msg_type, payload, &payload_len, sizeof(payload));
+
+
+        if (result == -2) {
+            // just a timeout, keep waiting, don't increment counter
+            continue;
+        }
+        if (result < 0) {
+            // real error, give up on this peer
+            return -1;
+        }
+        
+        
+        switch (msg_type) {
+            case MSG_UNCHOKE:
+                printf("Peer unchoked!\n");
+                peer->peer_choking = 0;
+                got_unchoke = 1;
+                break;
+            case MSG_CHOKE:
+                printf("Peer choked\n");
+                peer->peer_choking = 1;
+                break;
+            case MSG_BITFIELD:
+                printf("Received bitfield (%u bytes)\n", payload_len);
+                break;
+            case MSG_HAVE:
+                break;  // Ignore individual have messages
+            case MSG_KEEP_ALIVE:
+                break;
+            default:
+                printf("Unexpected message type: %u\n", msg_type);
+        }
+    }
+    
+    if (!got_unchoke) {
+        fprintf(stderr, "Timeout waiting for unchoke\n");
+        return -1;
+    }
+    
+    // Download piece in blocks
+    u32 downloaded = 0;
+    while (downloaded < piece_size) {
+        u32 block_size = (piece_size - downloaded < BLOCK_SIZE) ?  (piece_size - downloaded) : BLOCK_SIZE;
+        
+        printf("Requesting block at offset %u (size %u)...\n", downloaded, block_size);
+        
+        if (peer_request_block(peer, piece_index, downloaded, block_size) < 0) {
+            fprintf(stderr, "Failed to request block\n");
+            return -1;
+        }
+        
+        // Receive piece message
+        u8 msg_type;
+        u8 payload[BLOCK_SIZE + 8];
+        u32 payload_len;
+        
+        int retries = 0;
+        while (retries < 3) {
+            if (peer_recv_message(peer, &msg_type, payload, &payload_len, sizeof(payload)) < 0) {
+                retries++;
+                continue;
+            }
+            
+            if (msg_type == MSG_PIECE) {
+                if (payload_len < 8) {
+                    fprintf(stderr, "Invalid piece message\n");
+                    retries++;
+                    continue;
+                }
+                
+                PieceMessage *pm = (PieceMessage*)payload;
+                u32 recv_index = ntohl(pm->index);
+                u32 recv_begin = ntohl(pm->begin);
+                u32 data_len = payload_len - 8;
+                
+                if (recv_index != piece_index || recv_begin != downloaded) {
+                    printf("Unexpected piece data (expected index %u offset %u, got %u offset %u)\n",
+                           piece_index, downloaded, recv_index, recv_begin);
+                    retries++;
+                    continue;
+                }
+                
+                memcpy(piece_data + downloaded, payload + 8, data_len);
+                downloaded += data_len;
+                printf("Downloaded %u/%u bytes\n", downloaded, piece_size);
+                break;
+                
+            } else if (msg_type == MSG_KEEP_ALIVE) {
+                continue;
+            } else if (msg_type == MSG_CHOKE) {
+                fprintf(stderr, "Peer choked us\n");
+                return -1;
+            } else if (msg_type == MSG_HAVE) {
+                continue;  // ← add this, don't count as retry
+            } else {
+                printf("Unexpected message type: %u\n", msg_type);
+                retries++;
+            }
+        }
+        
+        if (retries >= 3) {
+            fprintf(stderr, "Failed to receive block\n");
+            return -1;
+        }
+    }
+    
+    printf("Piece %u downloaded successfully!\n", piece_index);
+    return 0;
+}
+
 // Main tracker communication function
 int communicate_with_tracker(const char *tracker_url, const u8 info_hash[20], Arena *arena, TorrentFile *torrent_file) {
     if (init_networking() < 0) {
@@ -1557,6 +1764,8 @@ int communicate_with_tracker(const char *tracker_url, const u8 info_hash[20], Ar
 
             if (peer_connect(peer_con, info_hash, peer_id, arena, torrent_file->num_pieces) == 0) {
                 u8 *piece_data = arena_alloc(arena, torrent_file->piece_length);
+
+                peer_download_piece(peer_con, 0, torrent_file->piece_length, piece_data);
  
                 // TODO: REMOVE:
                 exit(1);
