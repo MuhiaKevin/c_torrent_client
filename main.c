@@ -276,12 +276,18 @@ typedef struct {
 } Parser;
 
 
+
+typedef struct {
+    u8 data[20];
+} piece_hash;
+
+
 // Torrent struct
 typedef struct {
     u8 *announce;
     u8 info_hash[20];
     u8 *name;
-    Buffer *pieceHashes;
+    piece_hash *pieceHashes;
     usize  piece_length ;
     usize length;
     BcodeNode  *announce_list;
@@ -496,9 +502,8 @@ void print_single_hash(u8 *hash_ptr) {  // hash_ptr points to start of one 20-by
 }
 
 
-Buffer *split_pieces(BcodeNode *root, Arena *arena, TorrentFile *torrent_file) {
-    // create a buffer for the pieces
-    Buffer *pieces_buffer = {0};
+piece_hash * split_pieces(BcodeNode *root, Arena *arena, TorrentFile *torrent_file) {
+    piece_hash *pieces_buffer = {0};
 
     BcodeNode *info = dict_get(root, "info");
     if (info && info->type == BCODE_DICT) {
@@ -506,32 +511,27 @@ Buffer *split_pieces(BcodeNode *root, Arena *arena, TorrentFile *torrent_file) {
         BcodeNode *pieces = dict_get(info, "pieces");
         if (pieces && pieces->type == BCODE_STRING) {
 
-            pieces_buffer = arena_alloc(arena, sizeof(Buffer));
-            pieces_buffer ->len = pieces->string_val.len;
-
             size_t hash_len = 20;
             size_t num_hashes = pieces->string_val.len / hash_len;
 
-            // create a array of piecces hash with each array item being 20 bytes
-            u8 *hashes = arena_alloc(arena, (sizeof(u8) * 20) * num_hashes);
+            // create a array of piecces hash 
+            pieces_buffer = arena_alloc(arena, sizeof(piece_hash *) * num_hashes);
 
             // copy each 20 byte piece hash to new array
             for (size_t i = 0; i < num_hashes; i++) {
-                memcpy((hashes + i * hash_len), pieces->string_val.data + i * hash_len, hash_len);
+                memcpy(pieces_buffer[i].data, pieces->string_val.data + i * hash_len, hash_len);
             }
-            pieces_buffer->data = hashes;
+
             torrent_file->num_pieces = num_hashes;
 
-            /*printf("pieces length %zu\n", pieces_buffer->len);*/
-
             /*for (size_t i = 0; i < num_hashes; i++) {*/
-            /*    print_single_hash(&pieces_buffer->data[i]);*/
+            /*    print_single_hash(pieces_buffer[i].data);*/
             /*}*/
 
         }
     }
 
-    return  pieces_buffer;
+    return pieces_buffer;
 }
 
 
@@ -780,7 +780,7 @@ TorrentFile  buildTorrentFile(Buffer *torrent, BcodeNode *root, Arena *arena) {
     }
 
 
-    Buffer *pieceHashes = split_pieces(root, arena, &torrentFile);
+    piece_hash *pieceHashes = split_pieces(root, arena, &torrentFile);
     torrentFile.pieceHashes = pieceHashes;
     torrentFile.announce_list = announce_list;
 
