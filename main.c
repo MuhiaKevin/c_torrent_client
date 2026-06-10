@@ -1799,9 +1799,15 @@ void get_filenames(BcodeNode *info_dict) {
                 for(size_t i = 0; i < file_path->list_val.count; i++) {
                     BcodeNode *real_path = file_path->list_val.items[i];
                     if (real_path && real_path->type == BCODE_STRING) {
-                        printf("%s\n", real_path->string_val.data);
+                        printf("%s: ", real_path->string_val.data);
                     }
                 }
+            }
+
+
+            BcodeNode *file_length = dict_get(files->list_val.items[i], "length");
+            if (file_length  && file_length->type == BCODE_INT) {
+                printf("%zu\n", file_length->int_val);
             }
 
         }
