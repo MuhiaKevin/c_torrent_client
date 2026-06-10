@@ -1685,6 +1685,28 @@ int peer_download_piece(PeerConnection *peer, u32 piece_index, u32 piece_size, u
     return 0;
 }
 
+
+
+int verify_piece(u8 *piece_data, usize piece_length, piece_hash expected_hash) {
+    printf("Expected hash: ");
+    print_single_hash(expected_hash.data);
+
+    u8 computed_hash[20];
+    SHA1(piece_data, piece_length, computed_hash);
+
+    printf("Expected hash: ");
+    print_single_hash(computed_hash);
+    if (memcmp(computed_hash, expected_hash.data, 20) == 0) {
+        printf("Piece verified OK\n");
+        return 0;
+    } else {
+        printf("Piece verification FAILED!\n");
+        return -1;
+    }
+
+    return 0;
+}
+
 // Main tracker communication function
 int communicate_with_tracker(const char *tracker_url, const u8 info_hash[20], Arena *arena, TorrentFile *torrent_file) {
     if (init_networking() < 0) {
@@ -1764,8 +1786,14 @@ int communicate_with_tracker(const char *tracker_url, const u8 info_hash[20], Ar
 
             if (peer_connect(peer_con, info_hash, peer_id, arena, torrent_file->num_pieces) == 0) {
                 u8 *piece_data = arena_alloc(arena, torrent_file->piece_length);
+                piece_hash piece_hash = torrent_file->pieceHashes[0];
 
-                peer_download_piece(peer_con, 0, torrent_file->piece_length, piece_data);
+                if(peer_download_piece(peer_con, 0, torrent_file->piece_length, piece_data) == 0) {
+                    // verify
+                    if(verify_piece(piece_data, torrent_file->piece_length, piece_hash) == 0) {
+                    }
+
+                }
  
                 // TODO: REMOVE:
                 exit(1);
