@@ -1,3 +1,7 @@
+#define _POSIX_C_SOURCE 200809L
+#include <unistd.h>
+#include <assert.h>
+
 #include <openssl/sha.h>
 
 #ifdef _WIN32 // “If we are compiling on Windows… then use these header files
@@ -17,6 +21,8 @@ typedef SOCKET socket_t;
 #else
 // If not Windows, this part is used.
 #include <fcntl.h>
+#include <pthread.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -251,6 +257,51 @@ struct BcodeNode {
 
 
 typedef struct {
+    u8 data[20];
+} piece_hash;
+
+
+// different states of a piece
+typedef enum {
+    PIECE_MISSING,
+    PIECE_DOWNLOADING,
+    PIECE_DOWNLOADED,
+    PIECE_VERIFIED,
+} PieceState;
+
+
+// track information on a piece
+typedef struct {
+    u32 index;
+    PieceState state;
+    usize size;
+} Piece;
+
+typedef struct {
+    Piece *pieces; // track all the pieces in the torrent
+    usize num_pieces; 
+    u32 piece_length;
+
+    piece_hash *piece_hashes;
+
+    char output_path[1024]; // where we will store the data
+    bool is_multi_file;
+
+    BcodeNode *files_list; // list of the files
+
+    pthread_mutex_t lock;
+    atomic_int stop_flag;    // truly atomic
+    atomic_int active_downloads;
+
+
+    int output_fd;    // truly atomic
+
+    pthread_cond_t piece_done;
+
+} DownloadState;
+
+
+typedef struct {
     socket_t sock;
     char ip[16];
     u16 port;
@@ -275,11 +326,6 @@ typedef struct {
     Arena *arena;
 } Parser;
 
-
-
-typedef struct {
-    u8 data[20];
-} piece_hash;
 
 
 // Torrent struct
@@ -728,6 +774,15 @@ void calculate_info_hash(BcodeNode *info, const u8 *source_bytes, u8 hash[20]) {
     /*printf("\n");*/
 }
 
+// Generate random peer ID
+void generate_peer_id(u8 peer_id[20]) {
+    memcpy(peer_id, "-UT2026-", 8);  // Client ID: uTorrent 2026
+    for (int i = 8; i < 20; i++) {
+        peer_id[i] = '0' + (rand() % 10);
+    }
+}
+
+
 
 TorrentFile  buildTorrentFile(Buffer *torrent, BcodeNode *root, Arena *arena) {
     TorrentFile torrentFile = {0};
@@ -911,13 +966,6 @@ u32 random_transaction_id(void) {
     return (u32)time(NULL) ^ (u32)getpid();
 }
 
-// Generate random peer ID
-void generate_peer_id(u8 peer_id[20]) {
-    memcpy(peer_id, "-UT2026-", 8);  // Client ID: uTorrent 2026
-    for (int i = 8; i < 20; i++) {
-        peer_id[i] = '0' + (rand() % 10);
-    }
-}
 
 // Step 1: Connect to tracker
 int tracker_connect(socket_t sock, struct sockaddr_in *tracker_addr, u64 *connection_id) {
@@ -1103,22 +1151,6 @@ Handshake *build_handshake(Arena *arena, const u8 info_hash[20], const u8 peer_i
 
 
 
-PeerConnection *peer_create(char ip[20], u16 port, Arena *arena) {
-    PeerConnection *peer = arena_alloc(arena, sizeof(PeerConnection));
-
-    memset(peer, 0, sizeof(PeerConnection));
-
-    // initialize peer conneciton struct
-    strncpy(peer->ip, ip, sizeof(peer->ip) - 1);
-    peer->port = port;
-    peer->am_choking = 1;
-    peer->am_interested = 0;
-    peer->peer_choking = 1;
-    peer->peer_interested = 0;
-    peer->last_message_time = time(NULL);
-
-    return peer;
-}
 
 // connect to peer
 // 1. if peer is connectable then connect to next peer
@@ -1707,8 +1739,348 @@ int verify_piece(u8 *piece_data, usize piece_length, piece_hash expected_hash) {
     return 0;
 }
 
+
+int create_directory_structure(const char *path) { 
+#ifdef _WIN32
+    if(CreateDirectoryA(path, NULL) || GetLastError() == ERROR_ALREADY_EXISTS ){
+        return 0;
+    }
+
+    return -1;
+#else
+    if(mkdir(path, 0755) == 0 || errno == EEXIST ){
+        return 0;
+    }
+
+    return -1;
+#endif
+}
+
+typedef struct {
+    DownloadState *state;
+    Peer *peers;
+    usize peer_count;
+    u8 info_hash[20];
+    u8 peer_id[20];
+    Arena *arena;          // pointer, not value
+} DownloadWorkerArgs;
+
+
+int get_next_piece(DownloadState *state) {
+    pthread_mutex_lock(&state->lock);
+
+    for(usize i = 0; i < state->num_pieces; i++) {
+        // if the piece is missing then state that piece as missing then say that
+        // you are downloading that piece and return that piece index
+        if (state->pieces[i].state == PIECE_MISSING) {
+            state->pieces[i].state = PIECE_DOWNLOADING;
+            pthread_mutex_unlock(&state->lock);
+            return i;
+        }
+
+    }
+
+    pthread_mutex_unlock(&state->lock);
+    return -1;
+}
+
+
+PeerConnection *peer_create(char ip[20], u16 port, Arena *arena) {
+    PeerConnection *peer = arena_alloc(arena, sizeof(PeerConnection));
+
+    memset(peer, 0, sizeof(PeerConnection));
+
+    // initialize peer conneciton struct
+    strncpy(peer->ip, ip, sizeof(peer->ip) - 1);
+    peer->port = port;
+    peer->am_choking = 1;
+    peer->am_interested = 0;
+    peer->peer_choking = 1;
+    peer->peer_interested = 0;
+    peer->last_message_time = time(NULL);
+
+    return peer;
+}
+
+
+void mark_piece_done(DownloadState *state, u32 piece_index) {
+    pthread_mutex_lock(&state->lock);
+    state->pieces[piece_index].state = PIECE_VERIFIED;  // ← match what completion check expects
+    pthread_cond_signal(&state->piece_done);
+    pthread_mutex_unlock(&state->lock);
+}
+
+// Print download progress
+void print_progress(DownloadState *state) {
+    pthread_mutex_lock(&state->lock);
+
+    size_t downloaded = 0, verified = 0;
+    for (size_t i = 0; i < state->num_pieces; i++) {
+        if (state->pieces[i].state >= PIECE_DOWNLOADED) downloaded++;
+        if (state->pieces[i].state == PIECE_VERIFIED)   verified++;
+    }
+
+    double percent = (double)verified / state->num_pieces * 100.0;
+
+    // \033[2K clears the entire current line, \r returns to start
+    fprintf(stderr, "\033[2K\r[%3.0f%%] %zu/%zu pieces verified, %zu in progress",
+            percent, verified, state->num_pieces, downloaded);
+    fflush(stderr);
+
+    pthread_mutex_unlock(&state->lock);
+}
+
+void *download_worker(void *arg) {
+    DownloadWorkerArgs *a = (DownloadWorkerArgs *)arg;
+    printf("Worker starting: output_fd=%d\n", a->state->output_fd);
+
+    struct stat st;
+    assert(fstat(a->state->output_fd, &st) == 0);
+    assert(S_ISREG(st.st_mode) && "output_fd must be a regular file for pwrite");
+
+    u8 *buf = malloc(a->state->piece_length);
+    if (!buf) return NULL;
+
+    int piece_index;
+
+    while (!atomic_load(&a->state->stop_flag) && (piece_index = get_next_piece(a->state)) >= 0) {
+
+        size_t piece_size = a->state->pieces[piece_index].size;
+        int success = 0;
+
+        // ↓ Save arena offset ONCE per piece — all peer attempts for this
+        //   piece are scratch; reset after each attempt so the arena
+        //   never accumulates across the whole download.
+        size_t piece_arena_save = a->arena->offset;
+
+        for (size_t pi = 0; pi < a->peer_count && !success; pi++) {
+
+            // Reset to the save point before each peer attempt.
+            // Frees all PeerConnection, Handshake, bitfield allocs
+            // from the previous attempt without any individual free().
+            a->arena->offset = piece_arena_save;
+
+            char ip[16];
+            peer_ip_to_str(&a->peers[pi], ip);
+
+            PeerConnection *peer = peer_create(ip, ntohs(a->peers[pi].port), a->arena);
+
+            if (peer_connect(peer, a->info_hash, a->peer_id,
+                             a->arena, a->state->num_pieces) == 0) {
+
+                if (peer_download_piece(peer, piece_index,
+                                        piece_size, buf) == 0) {
+
+                    piece_hash expected = a->state->piece_hashes[piece_index];
+
+                    if (verify_piece(buf, piece_size, expected) == 0) {
+                        off_t off = (off_t)piece_index * a->state->piece_length;
+                        ssize_t n = pwrite(a->state->output_fd, buf, piece_size, off);
+                        if (n != (ssize_t)piece_size) {
+                            fprintf(stderr, "pwrite failed: piece=%d off=%ld size=%zu got=%zd errno=%s\n",
+                                    piece_index, (long)off, piece_size, n, strerror(errno));
+                        }
+
+                        if (n == (ssize_t)piece_size) {
+                            mark_piece_done(a->state, piece_index);
+                            success = 1;
+                        }
+                    }
+                }
+            }
+            close(peer->sock);
+        }
+
+        // Reset back to piece save point after all peer attempts —
+        // whether success or failure, nothing from this piece is needed anymore.
+        a->arena->offset = piece_arena_save;
+
+        if (!success) {
+            pthread_mutex_lock(&a->state->lock);
+            a->state->pieces[piece_index].state = PIECE_MISSING;
+            pthread_cond_signal(&a->state->piece_done);
+            pthread_mutex_unlock(&a->state->lock);
+        }
+    }
+
+    free(buf);
+    atomic_fetch_sub(&a->state->active_downloads, 1);
+    pthread_mutex_lock(&a->state->lock);
+    pthread_cond_signal(&a->state->piece_done);
+    pthread_mutex_unlock(&a->state->lock);
+    return NULL;
+}
+
+
+
+int download_all_pieces(DownloadState *state, Peer *peers, usize peer_count, const u8 info_hash[20], Arena *arena) {
+    assert(state != NULL);
+    assert(state->output_fd >= 0);
+    assert(state->num_pieces > 0);
+
+    printf("Starting download of %zu pieces with %zu peers\n", state->num_pieces, peer_count);
+    
+
+    if (state->is_multi_file) {
+        if (create_directory_structure(state->output_path) < 0) {
+            fprintf(stderr, "Failed to create output directory\n");
+            return -1;
+        }
+    }
+
+    //threading
+    u32 num_threads = 4;
+
+    printf("Starting %d download threads\n", num_threads);
+
+    pthread_t threads[num_threads];
+
+    state->active_downloads = num_threads;
+
+    u8 peer_id[20];
+    generate_peer_id(peer_id);
+
+    // One args entry per thread — each gets its own private arena
+    DownloadWorkerArgs args[num_threads];
+    for (u32 i = 0; i < num_threads; i++) {
+        args[i].state      = state;
+        args[i].peers      = peers;
+        args[i].peer_count = peer_count;
+        
+        args[i].arena = malloc(sizeof(Arena));
+        *args[i].arena = arena_create(MB(8));
+
+        memcpy(args[i].info_hash, info_hash, 20);
+        memcpy(args[i].peer_id,   peer_id,   20);
+        pthread_create(&threads[i], NULL, download_worker, &args[i]); // each thread has its own args and its own arena
+    }
+
+
+    int all_done = 0;
+
+    while(!all_done) {
+        pthread_mutex_lock(&state->lock);
+
+        usize verified = 0;
+
+        for(usize i = 0; i < state->num_pieces; i++) {
+            if(state->pieces[i].state == PIECE_VERIFIED) {
+                verified++;
+            }
+        }
+
+        all_done = (verified == state->num_pieces);
+        pthread_mutex_unlock(&state->lock);
+
+        if(!all_done) {
+            print_progress(state);
+        }
+    }
+
+    for (u32 i = 0; i < num_threads; i++) {
+        pthread_join(threads[i], NULL);
+        arena_destroy(args[i].arena);
+        free(args[i].arena);
+    }
+
+    printf("\n✓ All pieces downloaded and verified!\n");
+
+    return 0;
+}
+
+
+DownloadState *download_state_create(u32 num_pieces, u32 piece_length, piece_hash *piece_hashes, BcodeNode *info, const char *output_dir, Arena *arena, usize total_size) {
+    DownloadState *state = calloc(1, sizeof(DownloadState));
+    state->pieces = calloc(num_pieces, sizeof(Piece));
+
+    memset(state, 0, sizeof(DownloadState));
+
+    state->pieces      = arena_alloc(arena, sizeof(Piece) * num_pieces);
+    state->num_pieces  = num_pieces;
+    state->piece_hashes = piece_hashes;
+    state->piece_length = piece_length;
+
+    // Step 1: determine if multi-file
+    state->files_list   = dict_get(info, "files");
+    state->is_multi_file = (state->files_list &&
+                            state->files_list->type == BCODE_LIST);
+
+    // Step 2: build output_path
+
+    BcodeNode *name = dict_get(info, "name");
+
+    const char *torrent_name = (name && name->type == BCODE_STRING)
+        ? (char*)name->string_val.data
+        : "output.bin";
+
+    // Step 3: open output file (single file only)
+    if (!state->is_multi_file) {
+        // Single-file: output_path IS the file, not a directory.
+        // The directory component is output_dir, which already exists (/tmp).
+        snprintf(state->output_path, sizeof(state->output_path),
+                 "%s/%s", output_dir, torrent_name);
+
+        printf("Opening output file: '%s'\n", state->output_path);
+        state->output_fd = open(state->output_path,
+                                O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (state->output_fd < 0) {
+            perror("open output file");
+            return NULL;
+        }
+
+        u64 total_size = (u64)num_pieces * piece_length;
+        if (ftruncate(state->output_fd, total_size) < 0) {
+            perror("ftruncate");
+            close(state->output_fd);
+            return NULL;
+        }
+    } else {
+        // Multi-file: output_path is the root directory to create.
+        snprintf(state->output_path, sizeof(state->output_path),
+                 "%s/%s", output_dir, torrent_name);
+        // output_fd unused for multi-file (each file needs its own fd)
+        state->output_fd = -1;
+    }
+
+    /*// Step 4: initialize pieces*/
+    /*for (usize i = 0; i < num_pieces; i++) {*/
+    /*    state->pieces[i].index = i;*/
+    /*    state->pieces[i].state = PIECE_MISSING;*/
+    /*    state->pieces[i].size  = piece_length;*/
+    /*}*/
+
+
+    for (usize i = 0; i < num_pieces; i++) {
+        state->pieces[i].index = i;
+        state->pieces[i].state = PIECE_MISSING;
+        if (i == num_pieces - 1) {
+            state->pieces[i].size = total_size - (u64)(num_pieces - 1) * piece_length;
+        } else {
+            state->pieces[i].size = piece_length;
+        }
+    }
+
+    // After the initialization loop in download_state_create:
+    BcodeNode *length_node = dict_get(info, "length");
+    if (length_node && length_node->type == BCODE_INT) {
+        u64 total_size = (u64)length_node->int_val;
+        u64 last_piece_size = total_size - (u64)(num_pieces - 1) * piece_length;
+        state->pieces[num_pieces - 1].size = (usize)last_piece_size;
+        printf("Last piece size: %zu (others: %u)\n", 
+               (usize)last_piece_size, piece_length);
+    }
+
+
+    // Step 5: init synchronization primitives
+    pthread_mutex_init(&state->lock, NULL);
+    pthread_cond_init(&state->piece_done, NULL);
+    printf("MUTEX: %p\n", &state->lock);
+
+    return state;
+}
+
 // Main tracker communication function
-int communicate_with_tracker(const char *tracker_url, const u8 info_hash[20], Arena *arena, TorrentFile *torrent_file) {
+int communicate_with_tracker(const char *tracker_url, const u8 info_hash[20], Arena *arena, TorrentFile *torrent_file, BcodeNode *info_dict) {
     if (init_networking() < 0) {
         return -1;
     }
@@ -1766,48 +2138,29 @@ int communicate_with_tracker(const char *tracker_url, const u8 info_hash[20], Ar
     if(peers && peer_count > 0) {
         print_peers(peers, peer_count);
 
-        /*char *peer_ip[16];*/
-        /*peer_ip_to_str(&peers[0], peer_ip);*/
-        u8 peer_id[20];
-        generate_peer_id(peer_id);
+        char *output_dir = "/tmp";
+        DownloadState *dl_state = download_state_create(
+            torrent_file->num_pieces,
+            torrent_file->piece_length, 
+            torrent_file->pieceHashes, 
+            info_dict, 
+            output_dir, 
+            arena,
+            torrent_file->length 
+        );
 
-        PeerConnection **peer_cons = arena_alloc(arena, sizeof(PeerConnection *) * peer_count); // array of pointers
+        printf("dl_state = %p\n", (void*)dl_state);  // add this
+        printf("output_path = %s\n", dl_state ? dl_state->output_path : "NULL");
 
-        for(usize i = 0; i < peer_count; i++) {
-            char *peer_ip = arena_alloc(arena, 16);
-            peer_ip_to_str(&peers[i], peer_ip);
-
-            peer_cons[i] = peer_create(peer_ip, ntohs(peers[i].port), arena); // initialize
+        if (!dl_state) {
+            fprintf(stderr, "Failed to create download state\n");
+            close_socket(sock);
+            cleanup_networking();
+            return -1;
         }
 
-
-        for(usize i = 0; i < peer_count; i++) {
-            PeerConnection *peer_con = peer_cons[i];
-
-            if (peer_connect(peer_con, info_hash, peer_id, arena, torrent_file->num_pieces) == 0) {
-                u8 *piece_data = arena_alloc(arena, torrent_file->piece_length);
-                piece_hash piece_hash = torrent_file->pieceHashes[0];
-
-                if(peer_download_piece(peer_con, 0, torrent_file->piece_length, piece_data) == 0) {
-                    // verify
-                    if(verify_piece(piece_data, torrent_file->piece_length, piece_hash) == 0) {
-                    }
-
-                }
- 
-                // TODO: REMOVE:
-                exit(1);
-            }
-        }
-
-        
-        /*PeerConnection *peer = peer_create(peer_ip, ntohs(peers[0].port), arena);*/
-        /**/
-        /*if (peer_connect(peer, info_hash, peer_id) == 0) {*/
-        /*}*/
+        download_all_pieces(dl_state, peers, peer_count, info_hash, arena);
     }
-
-
 
 
     close_socket(sock);
@@ -1901,7 +2254,7 @@ int main(int argc, char **argv) {
         if (file_name && file_name->type == BCODE_STRING) {
             printf("File Name by: %s\n\n", file_name->string_val.data);
         }
-        /*get_filenames(info_dict);*/
+        get_filenames(info_dict);
     }
 
 
@@ -1912,7 +2265,7 @@ int main(int argc, char **argv) {
         printf("Tracker: %s\n\n", announce->string_val.data);
 
         // Communicate with tracker
-        communicate_with_tracker((char*)announce->string_val.data, torrentFile.info_hash, &arena, &torrentFile);
+        /*communicate_with_tracker((char*)announce->string_val.data, torrentFile.info_hash, &arena, &torrentFile, info_dict);*/
     }
 
 

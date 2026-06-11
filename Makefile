@@ -32,12 +32,13 @@ CC      = clang
 CFLAGS  = -m64 -std=c99 -Wall -Wextra -Wpedantic
 
 # If building debug:
-DEBUG_FLAGS = -DDEBUG -O0 -g -fsanitize=address 
+# DEBUG_FLAGS = -DDEBUG -O0 -g -fsanitize=address 
+DEBUG_FLAGS = -DDEBUG -O0 -g 
 LDLIBS  = -lssl -lcrypto 
 TARGET  = /tmp/torrent_client
 SRC     = main.c arena.c
 RELEASE_FLAGS = -DNDEBUG -O2
-TORRENT_FILE = ./kingdom.torrent
+TORRENT_FILE = ./ubuntuiso.torrent
 
 
 config ?= debug
