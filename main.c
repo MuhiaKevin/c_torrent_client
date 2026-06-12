@@ -114,6 +114,22 @@ typedef int64_t  i64;
 
 typedef struct BcodeNode BcodeNode;
 
+
+typedef struct {
+    char path[1024]; // full path: output_dir/name/subdir/file.bin
+    u64 offset; // byte offset of this file's start in the global stream 
+    u64 length;
+    int fd;
+} FileEntry;
+
+
+typedef struct {
+    FileEntry *files;
+    usize count;
+} FileMap;
+
+
+
 // Connect request/response
 typedef struct {
     u64 protocol_id;  // 0x41727101980
@@ -297,6 +313,9 @@ typedef struct {
     int output_fd;    // truly atomic
 
     pthread_cond_t piece_done;
+
+    FileMap file_map;
+    usize total_size;
 
 } DownloadState;
 
@@ -2197,6 +2216,92 @@ void get_filenames(BcodeNode *info_dict) {
 
 }
 
+
+// Call this from download_state_create() for multi-file torrents
+static int build_file_map(DownloadState *state, BcodeNode *info,
+                          const char *output_dir, Arena *arena) {
+    BcodeNode *name_node = dict_get(info, "name");
+    const char *root_name = (name_node && name_node->type == BCODE_STRING)
+                            ? (char*)name_node->string_val.data : "download";
+
+    BcodeNode *files = dict_get(info, "files");  // guaranteed non-NULL here
+    usize count = files->list_val.count;
+
+    state->file_map.files = arena_alloc(arena, sizeof(FileEntry) * count);
+    state->file_map.count = count;
+
+    u64 global_offset = 0;
+
+    for (usize i = 0; i < count; i++) {
+        BcodeNode *file_entry = files->list_val.items[i];
+        FileEntry *fe = &state->file_map.files[i];
+        fe->fd = -1;
+
+        // Get length
+        BcodeNode *len_node = dict_get(file_entry, "length");
+        fe->length = len_node ? (u64)len_node->int_val : 0;
+        fe->offset = global_offset;
+        global_offset += fe->length;
+
+        // Build path from path list: ["MD5", "QuickSFV.EXE"] → "MD5/QuickSFV.EXE"
+        BcodeNode *path_list = dict_get(file_entry, "path");
+        char rel_path[1024] = {0};
+        if (path_list && path_list->type == BCODE_LIST) {
+            for (usize j = 0; j < path_list->list_val.count; j++) {
+                // get file path
+                BcodeNode *seg = path_list->list_val.items[j];
+                
+                // Iterates over each path component. Skips any item that isn't a string — defensive check against malformed torrents.
+                // if the path is not string then ignore and move on the next list item
+                if (seg->type != BCODE_STRING) {
+                    continue;
+                }
+
+                // ["MD5", "QuickSFV.EXE"] 
+
+                // iteration j=0:
+                //     seg->string_val.data = "MD5"
+                //     j == 0, skip separator
+                //     strncat(rel_path, "MD5", 1024 - 0 - 1 = 1023)
+                //     rel_path = "MD5"
+
+                // iteration j=1:
+                //     seg->string_val.data = "QuickSFV.EXE"
+                //     j > 0, add separator first
+                //     strncat(rel_path, "/", 1024 - 3 - 1 = 1020)
+                //     rel_path = "MD5/"
+                //     strncat(rel_path, "QuickSFV.EXE", 1024 - 4 - 1 = 1019)
+                //     rel_path = "MD5/QuickSFV.EXE"
+
+                // this bascially adds a trailing "/" if the string is not the first in the array
+                if (j > 0) {
+                  // add "/" to
+                  // This ensures you never write past the end of rel_path no
+                  // matter how long the path components are. The -1 always
+                  // reserves one byte for the null terminator that strncat
+                  // automatically appends.
+                  strncat(rel_path, "/", sizeof(rel_path) - strlen(rel_path) - 1);
+                }
+
+                strncat(rel_path, (char*)seg->string_val.data, sizeof(rel_path) - strlen(rel_path) - 1);
+            }
+        }
+
+        // Then the snprintf combines it with output_dir and root_name:
+        // "/tmp" + "/" + "MyTorrent" + "/" + "MD5/QuickSFV.EXE" = "/tmp/MyTorrent/MD5/QuickSFV.EXE"
+
+        // merge the output directory, the file name of the torrent and the actual path of the file and save it to the file entry path
+        snprintf(fe->path, sizeof(fe->path), "%s/%s/%s", output_dir, root_name, rel_path);
+
+        printf("File[%zu]: offset=%-12llu len=%-12llu path=%s\n", i, (unsigned long long)fe->offset, (unsigned long long)fe->length, fe->path); 
+    }
+
+    state->total_size = global_offset;  // add this field to DownloadState
+    return 0;
+}
+
+
+
 int main(int argc, char **argv) {
     if(argc < 2) {
         fprintf(stderr, "Usage: %s <filename>\n", argv[0]);
@@ -2254,7 +2359,7 @@ int main(int argc, char **argv) {
         if (file_name && file_name->type == BCODE_STRING) {
             printf("File Name by: %s\n\n", file_name->string_val.data);
         }
-        get_filenames(info_dict);
+        /*get_filenames(info_dict);*/
     }
 
 
@@ -2268,6 +2373,21 @@ int main(int argc, char **argv) {
         /*communicate_with_tracker((char*)announce->string_val.data, torrentFile.info_hash, &arena, &torrentFile, info_dict);*/
     }
 
+
+        
+    char *output_dir = "/tmp/something";
+
+    DownloadState *dl_state = download_state_create(
+        torrentFile.num_pieces,
+        torrentFile.piece_length, 
+        torrentFile.pieceHashes, 
+        info_dict, 
+        output_dir, 
+        &arena,
+        torrentFile.length 
+    );
+
+    build_file_map(dl_state, info_dict, output_dir, &arena);
 
     arena_destroy(&arena);
     return 0;
