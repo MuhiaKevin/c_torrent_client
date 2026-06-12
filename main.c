@@ -294,29 +294,28 @@ typedef struct {
 } Piece;
 
 typedef struct {
-    Piece *pieces; // track all the pieces in the torrent
-    usize num_pieces; 
-    u32 piece_length;
+    Piece     *pieces;
+    usize      num_pieces;
+    u32        piece_length;
+    u64        total_size;      // ← add this
 
     piece_hash *piece_hashes;
 
-    char output_path[1024]; // where we will store the data
-    bool is_multi_file;
+    char       output_path[1024];
+    bool       is_multi_file;
 
-    BcodeNode *files_list; // list of the files
+    // Single-file
+    int        output_fd;
+
+    // Multi-file
+    FileMap    file_map;        // ← add this
+
+    BcodeNode *files_list;
 
     pthread_mutex_t lock;
-    atomic_int stop_flag;    // truly atomic
-    atomic_int active_downloads;
-
-
-    int output_fd;    // truly atomic
-
-    pthread_cond_t piece_done;
-
-    FileMap file_map;
-    usize total_size;
-
+    pthread_cond_t  piece_done;
+    atomic_int      stop_flag;
+    atomic_int      active_downloads;
 } DownloadState;
 
 
@@ -1842,20 +1841,82 @@ void print_progress(DownloadState *state) {
     double percent = (double)verified / state->num_pieces * 100.0;
 
     // \033[2K clears the entire current line, \r returns to start
-    fprintf(stderr, "\033[2K\r[%3.0f%%] %zu/%zu pieces verified, %zu in progress",
+    fprintf(stderr, "\033[2K\r[%3.0f%%] %zu/%zu pieces verified, %zu in progress\n",
             percent, verified, state->num_pieces, downloaded);
     fflush(stderr);
 
     pthread_mutex_unlock(&state->lock);
 }
 
+
+static int write_piece(DownloadState *state, u32 piece_index,
+                       u8 *buf, usize piece_size) {
+
+    if (!state->is_multi_file) {
+        off_t off = (off_t)piece_index * state->piece_length;
+        ssize_t n = pwrite(state->output_fd, buf, piece_size, off);
+        if (n != (ssize_t)piece_size) {
+            perror("pwrite single-file");
+            return -1;
+        }
+        return 0;
+    }
+
+    // Global byte range this piece covers in the concatenated stream
+    u64 piece_start = (u64)piece_index * state->piece_length;
+    u64 piece_end   = piece_start + piece_size;
+
+    for (usize i = 0; i < state->file_map.count; i++) {
+        FileEntry *fe = &state->file_map.files[i];
+
+        u64 file_end = fe->offset + fe->length;
+
+        // Skip files entirely outside this piece's range
+        if (file_end   <= piece_start) continue;
+        if (fe->offset >= piece_end)   break;
+
+        // Clamp to the overlap region
+        u64 overlap_start = piece_start > fe->offset ? piece_start : fe->offset;
+        u64 overlap_end   = piece_end   < file_end   ? piece_end   : file_end;
+
+        u64 buf_offset  = overlap_start - piece_start;  // offset into buf
+        u64 file_offset = overlap_start - fe->offset;   // offset into this file
+        u64 write_len   = overlap_end   - overlap_start;
+
+        ssize_t n = pwrite(fe->fd, buf + buf_offset,
+                           write_len, (off_t)file_offset);
+        if (n != (ssize_t)write_len) {
+            fprintf(stderr,
+                    "pwrite failed: file=%s file_off=%llu "
+                    "len=%llu got=%zd err=%s\n",
+                    fe->path,
+                    (unsigned long long)file_offset,
+                    (unsigned long long)write_len,
+                    n, strerror(errno));
+            return -1;
+        }
+    }
+
+    return 0;
+}
+
 void *download_worker(void *arg) {
     DownloadWorkerArgs *a = (DownloadWorkerArgs *)arg;
-    printf("Worker starting: output_fd=%d\n", a->state->output_fd);
 
-    struct stat st;
-    assert(fstat(a->state->output_fd, &st) == 0);
-    assert(S_ISREG(st.st_mode) && "output_fd must be a regular file for pwrite");
+    // Verify storage is ready before doing any work
+    if (a->state->is_multi_file) {
+        // Every file entry must have a valid open fd
+        for (usize i = 0; i < a->state->file_map.count; i++) {
+            assert(a->state->file_map.files[i].fd >= 0 &&
+                   "file_map fd not open — build_file_map failed?");
+        }
+    } else {
+        // Single file must have a valid seekable fd
+        struct stat st;
+        assert(a->state->output_fd >= 0);
+        assert(fstat(a->state->output_fd, &st) == 0);
+        assert(S_ISREG(st.st_mode) && "output_fd must be a regular file");
+    }
 
     u8 *buf = malloc(a->state->piece_length);
     if (!buf) return NULL;
@@ -1893,14 +1954,7 @@ void *download_worker(void *arg) {
                     piece_hash expected = a->state->piece_hashes[piece_index];
 
                     if (verify_piece(buf, piece_size, expected) == 0) {
-                        off_t off = (off_t)piece_index * a->state->piece_length;
-                        ssize_t n = pwrite(a->state->output_fd, buf, piece_size, off);
-                        if (n != (ssize_t)piece_size) {
-                            fprintf(stderr, "pwrite failed: piece=%d off=%ld size=%zu got=%zd errno=%s\n",
-                                    piece_index, (long)off, piece_size, n, strerror(errno));
-                        }
-
-                        if (n == (ssize_t)piece_size) {
+                        if (write_piece(a->state, piece_index, buf, piece_size) == 0) {
                             mark_piece_done(a->state, piece_index);
                             success = 1;
                         }
@@ -1992,7 +2046,7 @@ int download_all_pieces(DownloadState *state, Peer *peers, usize peer_count, con
         pthread_mutex_unlock(&state->lock);
 
         if(!all_done) {
-            print_progress(state);
+            /*print_progress(state);*/
         }
     }
 
@@ -2008,6 +2062,95 @@ int download_all_pieces(DownloadState *state, Peer *peers, usize peer_count, con
 }
 
 
+
+// Call this from download_state_create() for multi-file torrents
+static int build_file_map(DownloadState *state, BcodeNode *info, const char *output_dir, Arena *arena) {
+    BcodeNode *name_node = dict_get(info, "name");
+    const char *root_name = (name_node && name_node->type == BCODE_STRING)
+                            ? (char*)name_node->string_val.data : "download";
+
+    BcodeNode *files = dict_get(info, "files");
+    usize count = files->list_val.count;
+
+    state->file_map.files = arena_alloc(arena, sizeof(FileEntry) * count);
+    state->file_map.count = count;
+
+    u64 global_offset = 0;
+
+    for (usize i = 0; i < count; i++) {
+        BcodeNode *file_entry = files->list_val.items[i];
+        FileEntry *fe = &state->file_map.files[i];
+        fe->fd = -1;
+
+        // Get length
+        BcodeNode *len_node = dict_get(file_entry, "length");
+        fe->length = len_node ? (u64)len_node->int_val : 0;
+        fe->offset = global_offset;
+        global_offset += fe->length;
+
+        // Build relative path from path list segments
+        // ["MD5", "QuickSFV.EXE"] → "MD5/QuickSFV.EXE"
+        char rel_path[1024] = {0};
+        BcodeNode *path_list = dict_get(file_entry, "path");
+        if (path_list && path_list->type == BCODE_LIST) {
+            for (usize j = 0; j < path_list->list_val.count; j++) {
+                BcodeNode *seg = path_list->list_val.items[j];
+                if (seg->type != BCODE_STRING) continue;
+                if (j > 0)
+                    strncat(rel_path, "/",
+                            sizeof(rel_path) - strlen(rel_path) - 1);
+                strncat(rel_path, (char*)seg->string_val.data,
+                        sizeof(rel_path) - strlen(rel_path) - 1);
+            }
+        }
+
+        snprintf(fe->path, sizeof(fe->path), "%s/%s/%s",
+                 output_dir, root_name, rel_path);
+
+        // Create all intermediate directories before opening the file.
+        // For "output/Name/MD5/QuickSFV.EXE" we need "output/Name/MD5/" to exist.
+        char dir_path[1024];
+        strncpy(dir_path, fe->path, sizeof(dir_path));
+        char *last_slash = strrchr(dir_path, '/');
+        if (last_slash) {
+            *last_slash = '\0';
+            // Walk each path component and mkdir each one
+            for (char *p = dir_path + 1; *p; p++) {
+                if (*p == '/') {
+                    *p = '\0';
+                    mkdir(dir_path, 0755);  // ignore EEXIST
+                    *p = '/';
+                }
+            }
+            mkdir(dir_path, 0755);  // final component
+        }
+
+        // Open file upfront — no race possible since this runs
+        // single-threaded before any workers are spawned
+        fe->fd = open(fe->path, O_WRONLY | O_CREAT, 0644);
+        if (fe->fd < 0) {
+            perror("open file entry");
+            fprintf(stderr, "  path: %s\n", fe->path);
+            return -1;
+        }
+
+        // Pre-allocate file size so pwrite at any offset works
+        if (ftruncate(fe->fd, (off_t)fe->length) < 0) {
+            perror("ftruncate file entry");
+            // Non-fatal on some filesystems, continue
+        }
+
+        printf("ftruncate: fe->length = %llu\n", (unsigned long long)fe->length);
+
+        printf("File[%zu]: offset=%-14llu len=%-14llu path=%s\n",
+               i, (unsigned long long)fe->offset,
+                  (unsigned long long)fe->length, fe->path);
+    }
+
+    state->total_size = global_offset;
+    return 0;
+}
+
 DownloadState *download_state_create(u32 num_pieces, u32 piece_length, piece_hash *piece_hashes, BcodeNode *info, const char *output_dir, Arena *arena, usize total_size) {
     DownloadState *state = calloc(1, sizeof(DownloadState));
     state->pieces = calloc(num_pieces, sizeof(Piece));
@@ -2022,7 +2165,7 @@ DownloadState *download_state_create(u32 num_pieces, u32 piece_length, piece_has
     // Step 1: determine if multi-file
     state->files_list   = dict_get(info, "files");
     state->is_multi_file = (state->files_list &&
-                            state->files_list->type == BCODE_LIST);
+        state->files_list->type == BCODE_LIST);
 
     // Step 2: build output_path
 
@@ -2032,71 +2175,67 @@ DownloadState *download_state_create(u32 num_pieces, u32 piece_length, piece_has
         ? (char*)name->string_val.data
         : "output.bin";
 
-    // Step 3: open output file (single file only)
-    if (!state->is_multi_file) {
-        // Single-file: output_path IS the file, not a directory.
-        // The directory component is output_dir, which already exists (/tmp).
+
+
+    if (state->is_multi_file) {
         snprintf(state->output_path, sizeof(state->output_path),
                  "%s/%s", output_dir, torrent_name);
+        mkdir(state->output_path, 0755);
 
-        printf("Opening output file: '%s'\n", state->output_path);
+        if (build_file_map(state, info, output_dir, arena) < 0)
+            return NULL;
+        // total_size now set by build_file_map
+
+    } else {
+        snprintf(state->output_path, sizeof(state->output_path),
+                 "%s/%s", output_dir, torrent_name);
         state->output_fd = open(state->output_path,
                                 O_WRONLY | O_CREAT | O_TRUNC, 0644);
-        if (state->output_fd < 0) {
-            perror("open output file");
-            return NULL;
-        }
+        if (state->output_fd < 0) { perror("open"); return NULL; }
 
-        u64 total_size = (u64)num_pieces * piece_length;
-        if (ftruncate(state->output_fd, total_size) < 0) {
-            perror("ftruncate");
-            close(state->output_fd);
-            return NULL;
+        BcodeNode *len_node = dict_get(info, "length");
+        state->total_size = len_node ? (u64)len_node->int_val
+            : (u64)num_pieces * piece_length;
+        if (ftruncate(state->output_fd, (off_t)state->total_size) < 0) {
+            perror("ftruncate"); return NULL;
         }
-    } else {
-        // Multi-file: output_path is the root directory to create.
-        snprintf(state->output_path, sizeof(state->output_path),
-                 "%s/%s", output_dir, torrent_name);
-        // output_fd unused for multi-file (each file needs its own fd)
-        state->output_fd = -1;
     }
 
-    /*// Step 4: initialize pieces*/
-    /*for (usize i = 0; i < num_pieces; i++) {*/
-    /*    state->pieces[i].index = i;*/
-    /*    state->pieces[i].state = PIECE_MISSING;*/
-    /*    state->pieces[i].size  = piece_length;*/
-    /*}*/
-
-
+    // Initialize piece array — must happen after total_size is known
     for (usize i = 0; i < num_pieces; i++) {
         state->pieces[i].index = i;
         state->pieces[i].state = PIECE_MISSING;
-        if (i == num_pieces - 1) {
-            state->pieces[i].size = total_size - (u64)(num_pieces - 1) * piece_length;
-        } else {
-            state->pieces[i].size = piece_length;
-        }
+        state->pieces[i].size  = piece_length;
     }
 
-    // After the initialization loop in download_state_create:
-    BcodeNode *length_node = dict_get(info, "length");
-    if (length_node && length_node->type == BCODE_INT) {
-        u64 total_size = (u64)length_node->int_val;
-        u64 last_piece_size = total_size - (u64)(num_pieces - 1) * piece_length;
-        state->pieces[num_pieces - 1].size = (usize)last_piece_size;
-        printf("Last piece size: %zu (others: %u)\n", 
-               (usize)last_piece_size, piece_length);
+    // Fix last piece — always smaller unless total is a perfect multiple
+    if (state->total_size > 0 && num_pieces > 0) {
+        u64 last = state->total_size - (u64)(num_pieces - 1) * piece_length;
+        state->pieces[num_pieces - 1].size = (usize)last;
+        printf("Last piece size: %llu bytes (piece_length=%u)\n",
+               (unsigned long long)last, piece_length);
     }
 
-
-    // Step 5: init synchronization primitives
     pthread_mutex_init(&state->lock, NULL);
     pthread_cond_init(&state->piece_done, NULL);
     printf("MUTEX: %p\n", &state->lock);
 
     return state;
 }
+
+
+void file_map_close(FileMap *fm) {
+    for (usize i = 0; i < fm->count; i++) {
+        if (fm->files[i].fd >= 0) {
+            // fsync before close — ensures data hits disk,
+            // not just the page cache
+            fsync(fm->files[i].fd);
+            close(fm->files[i].fd);
+            fm->files[i].fd = -1;
+        }
+    }
+}
+
 
 // Main tracker communication function
 int communicate_with_tracker(const char *tracker_url, const u8 info_hash[20], Arena *arena, TorrentFile *torrent_file, BcodeNode *info_dict) {
@@ -2179,6 +2318,17 @@ int communicate_with_tracker(const char *tracker_url, const u8 info_hash[20], Ar
         }
 
         download_all_pieces(dl_state, peers, peer_count, info_hash, arena);
+
+        // Flush and close all file descriptors
+        if (dl_state->is_multi_file) {
+            file_map_close(&dl_state->file_map);
+        } else {
+            if (dl_state->output_fd >= 0) {
+                fsync(dl_state->output_fd);
+                close(dl_state->output_fd);
+                dl_state->output_fd = -1;
+            }
+        }
     }
 
 
@@ -2216,89 +2366,6 @@ void get_filenames(BcodeNode *info_dict) {
 
 }
 
-
-// Call this from download_state_create() for multi-file torrents
-static int build_file_map(DownloadState *state, BcodeNode *info,
-                          const char *output_dir, Arena *arena) {
-    BcodeNode *name_node = dict_get(info, "name");
-    const char *root_name = (name_node && name_node->type == BCODE_STRING)
-                            ? (char*)name_node->string_val.data : "download";
-
-    BcodeNode *files = dict_get(info, "files");  // guaranteed non-NULL here
-    usize count = files->list_val.count;
-
-    state->file_map.files = arena_alloc(arena, sizeof(FileEntry) * count);
-    state->file_map.count = count;
-
-    u64 global_offset = 0;
-
-    for (usize i = 0; i < count; i++) {
-        BcodeNode *file_entry = files->list_val.items[i];
-        FileEntry *fe = &state->file_map.files[i];
-        fe->fd = -1;
-
-        // Get length
-        BcodeNode *len_node = dict_get(file_entry, "length");
-        fe->length = len_node ? (u64)len_node->int_val : 0;
-        fe->offset = global_offset;
-        global_offset += fe->length;
-
-        // Build path from path list: ["MD5", "QuickSFV.EXE"] → "MD5/QuickSFV.EXE"
-        BcodeNode *path_list = dict_get(file_entry, "path");
-        char rel_path[1024] = {0};
-        if (path_list && path_list->type == BCODE_LIST) {
-            for (usize j = 0; j < path_list->list_val.count; j++) {
-                // get file path
-                BcodeNode *seg = path_list->list_val.items[j];
-                
-                // Iterates over each path component. Skips any item that isn't a string — defensive check against malformed torrents.
-                // if the path is not string then ignore and move on the next list item
-                if (seg->type != BCODE_STRING) {
-                    continue;
-                }
-
-                // ["MD5", "QuickSFV.EXE"] 
-
-                // iteration j=0:
-                //     seg->string_val.data = "MD5"
-                //     j == 0, skip separator
-                //     strncat(rel_path, "MD5", 1024 - 0 - 1 = 1023)
-                //     rel_path = "MD5"
-
-                // iteration j=1:
-                //     seg->string_val.data = "QuickSFV.EXE"
-                //     j > 0, add separator first
-                //     strncat(rel_path, "/", 1024 - 3 - 1 = 1020)
-                //     rel_path = "MD5/"
-                //     strncat(rel_path, "QuickSFV.EXE", 1024 - 4 - 1 = 1019)
-                //     rel_path = "MD5/QuickSFV.EXE"
-
-                // this bascially adds a trailing "/" if the string is not the first in the array
-                if (j > 0) {
-                  // add "/" to
-                  // This ensures you never write past the end of rel_path no
-                  // matter how long the path components are. The -1 always
-                  // reserves one byte for the null terminator that strncat
-                  // automatically appends.
-                  strncat(rel_path, "/", sizeof(rel_path) - strlen(rel_path) - 1);
-                }
-
-                strncat(rel_path, (char*)seg->string_val.data, sizeof(rel_path) - strlen(rel_path) - 1);
-            }
-        }
-
-        // Then the snprintf combines it with output_dir and root_name:
-        // "/tmp" + "/" + "MyTorrent" + "/" + "MD5/QuickSFV.EXE" = "/tmp/MyTorrent/MD5/QuickSFV.EXE"
-
-        // merge the output directory, the file name of the torrent and the actual path of the file and save it to the file entry path
-        snprintf(fe->path, sizeof(fe->path), "%s/%s/%s", output_dir, root_name, rel_path);
-
-        printf("File[%zu]: offset=%-12llu len=%-12llu path=%s\n", i, (unsigned long long)fe->offset, (unsigned long long)fe->length, fe->path); 
-    }
-
-    state->total_size = global_offset;  // add this field to DownloadState
-    return 0;
-}
 
 
 
@@ -2370,24 +2437,8 @@ int main(int argc, char **argv) {
         printf("Tracker: %s\n\n", announce->string_val.data);
 
         // Communicate with tracker
-        /*communicate_with_tracker((char*)announce->string_val.data, torrentFile.info_hash, &arena, &torrentFile, info_dict);*/
+        communicate_with_tracker((char*)announce->string_val.data, torrentFile.info_hash, &arena, &torrentFile, info_dict);
     }
-
-
-        
-    char *output_dir = "/tmp/something";
-
-    DownloadState *dl_state = download_state_create(
-        torrentFile.num_pieces,
-        torrentFile.piece_length, 
-        torrentFile.pieceHashes, 
-        info_dict, 
-        output_dir, 
-        &arena,
-        torrentFile.length 
-    );
-
-    build_file_map(dl_state, info_dict, output_dir, &arena);
 
     arena_destroy(&arena);
     return 0;
